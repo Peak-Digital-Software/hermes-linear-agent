@@ -1,0 +1,457 @@
+"""Regression tests for the peak/patches hardening pass on the Linear adapter.
+
+Covers: per-issue session keying (one Hermes session per Linear ISSUE, not per
+agentSession), the stop-signal key contract, strict ``mutation_policy``
+parsing, the fail-closed configured-workspace check, ``/p/<profile>/`` path
+validation, and the loopback default bind host.
+"""
+
+import asyncio
+import hashlib
+import hmac
+import json
+import time
+
+import pytest
+from gateway.config import PlatformConfig
+
+from hermes_linear_agent.adapter import (
+    DEFAULT_HOST,
+    LinearAgentAdapter,
+    LinearAgentConfigError,
+)
+from hermes_linear_agent.webhook import extract_context
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+
+class _FakeLinearClient:
+    def __init__(self):
+        self.calls = []
+
+    async def create_thought(self, agent_session_id, body, *, ephemeral=False):
+        self.calls.append(("thought", agent_session_id, body))
+        return {"id": "thought-1"}
+
+    async def create_response(self, agent_session_id, body, *, response_type="response", ephemeral=False, signal=None):
+        self.calls.append((response_type, agent_session_id, body))
+        return {"id": "response-1"}
+
+    async def create_error(self, agent_session_id, body):
+        self.calls.append(("error", agent_session_id, body))
+        return {"id": "error-1"}
+
+    async def create_comment(self, issue_id, body, *, parent_id=None, mutation_policy=None):
+        self.calls.append(("comment", issue_id, body, mutation_policy))
+        return {"id": "comment-1"}
+
+
+def _body(payload):
+    return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+
+def _headers(raw_body, secret="secret", delivery_id="evt-1"):
+    return {
+        "Linear-Signature": "sha256=" + hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest(),
+        "Linear-Timestamp": str(int(time.time() * 1000)),
+        "Linear-Delivery-Id": delivery_id,
+    }
+
+
+def _prompted_payload(event_id="evt-1", *, session_id="session-1", issue_id="issue-1", body="Keep going."):
+    return {
+        "action": "prompted",
+        "id": event_id,
+        "agentSession": {
+            "id": session_id,
+            "workspaceId": "workspace-1",
+            "issue": {
+                "id": issue_id,
+                "identifier": "LIN-123",
+                "title": "Fix the flaky job",
+                "team": {"id": "team-1"},
+            },
+        },
+        "agentActivity": {"id": "activity-1", "body": body, "actor": {"id": "user-1", "name": "Ada"}},
+    }
+
+
+def _created_payload(event_id="evt-1", *, session_id="session-1", issue_id="issue-1"):
+    payload = _prompted_payload(event_id, session_id=session_id, issue_id=issue_id)
+    payload["action"] = "created"
+    payload["promptContext"] = "The issue has a failing CI check."
+    return payload
+
+
+def _make_adapter(*, extra=None, client=None):
+    merged = {
+        "access_token": "linear-token",
+        "webhook_secret": "secret",
+        "allow_all_users": True,
+    }
+    if extra:
+        merged.update(extra)
+    return LinearAgentAdapter(PlatformConfig(enabled=True, extra=merged), client=client or _FakeLinearClient())
+
+
+async def _post(adapter, payload, *, profile=None, delivery_id=None):
+    raw = _body(payload)
+    headers = _headers(raw, delivery_id=delivery_id or payload["id"])
+    return await adapter.handle_webhook(headers, raw, profile=profile)
+
+
+async def _settle():
+    """Let handle_message's background dispatch task reach the handler."""
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+
+# ---------------------------------------------------------------------------
+# P3 — one Hermes session per ISSUE
+# ---------------------------------------------------------------------------
+
+
+def test_two_agent_sessions_on_one_issue_share_a_session_key():
+    """Linear mints a new agentSession per mention; the Hermes session must not."""
+    adapter = _make_adapter()
+    first = _prompted_payload(session_id="session-1")
+    second = _prompted_payload(session_id="session-2")
+
+    key_first = adapter._session_key_for(extract_context(first, {}))
+    key_second = adapter._session_key_for(extract_context(second, {}))
+
+    assert key_first == key_second
+    assert "issue-1" in key_first
+
+
+def test_different_issues_get_different_session_keys():
+    adapter = _make_adapter()
+    one = _prompted_payload(issue_id="issue-1")
+    two = _prompted_payload(issue_id="issue-2")
+
+    assert adapter._session_key_for(extract_context(one, {})) != adapter._session_key_for(extract_context(two, {}))
+
+
+def _gateway_key(source, *, group_sessions_per_user=True, thread_sessions_per_user=False):
+    """The key the gateway runner itself derives for a source.
+
+    ``GatewayRunner._session_key_for_source`` → ``SessionStore._generate_session_key``
+    → ``gateway.session.build_session_key``. Keying history in the store happens
+    THERE, so the adapter's own key is only correct if it matches this exactly.
+    """
+    from gateway.session import build_session_key
+
+    return build_session_key(
+        source,
+        group_sessions_per_user=group_sessions_per_user,
+        thread_sessions_per_user=thread_sessions_per_user,
+    )
+
+
+def test_session_key_matches_the_gateway_runner_key_for_the_built_source():
+    adapter = _make_adapter()
+    for session_id in ("session-1", "session-2"):
+        context = extract_context(_prompted_payload(session_id=session_id), {})
+        source = adapter._build_source(context)
+        assert adapter._session_key_for(context) == _gateway_key(source)
+        assert source.chat_id == "issue-1"
+
+
+def test_issue_session_ignores_the_agent_session_and_the_user():
+    """One Hermes session per ISSUE: a follow-up mention from another allowed
+    user on the same issue lands in the same session (thread semantics), unless
+    the operator opts into per-user thread sessions."""
+    adapter = _make_adapter()
+    first = _prompted_payload(session_id="session-1")
+    second = _prompted_payload(session_id="session-2", event_id="evt-2")
+    second["agentActivity"]["actor"] = {"id": "user-2", "name": "Tom"}
+
+    assert adapter._session_key_for(extract_context(first, {})) == adapter._session_key_for(extract_context(second, {}))
+
+    per_user = _make_adapter(extra={"thread_sessions_per_user": True})
+    assert per_user._session_key_for(extract_context(first, {})) != per_user._session_key_for(
+        extract_context(second, {})
+    )
+
+
+@pytest.mark.asyncio
+async def test_replies_for_the_issue_go_to_the_newest_agent_session():
+    """Both mentions run in ONE Hermes session keyed by the issue, and the
+    gateway's reply (delivered on the source chat_id = the issue id) must
+    resolve to the NEWEST Linear agent session, not the first one."""
+    client = _FakeLinearClient()
+    adapter = _make_adapter(client=client)
+    events = []
+
+    async def capture(event):
+        events.append(event)
+
+    adapter._message_handler = capture
+
+    await _post(adapter, _prompted_payload(session_id="session-1", event_id="evt-1"), delivery_id="evt-1")
+    await _settle()
+    # The newer Linear agent session on the SAME issue (the follow-up turn).
+    await _post(adapter, _prompted_payload(session_id="session-2", event_id="evt-2"), delivery_id="evt-2")
+    await _settle()
+
+    # One session, keyed by the issue — not one per Linear agent session.
+    assert [event.source.chat_id for event in events] == ["issue-1", "issue-1"]
+    assert events[0].source.thread_id == events[1].source.thread_id == "issue-1"
+    assert adapter._session_key_for(
+        extract_context(_prompted_payload(session_id="session-1"), {})
+    ) == adapter._session_key_for(extract_context(_prompted_payload(session_id="session-2"), {}))
+
+    # The gateway replies to the inbound event's own source chat_id (issue id).
+    newer = events[-1]
+    result = await adapter.send(newer.source.chat_id, "Done — here is what I found.")
+    assert result.success is True
+    responses = [call for call in client.calls if call[0] == "response"]
+    assert responses[-1][1] == "session-2"
+
+
+@pytest.mark.asyncio
+async def test_unknown_chat_id_falls_back_to_an_issue_comment():
+    """After a restart (or for cron/home delivery) the per-issue session map is
+    empty: the reply must still land, as a comment on the issue."""
+    client = _FakeLinearClient()
+    adapter = _make_adapter(client=client, extra={"mutation_policy": {"create_comments": True}})
+
+    result = await adapter.send("issue-1", "Here is the scheduled result.")
+
+    assert result.success is True
+    assert [call[0] for call in client.calls] == ["comment"]
+    assert client.calls[0][1] == "issue-1"
+
+
+@pytest.mark.asyncio
+async def test_stop_signal_from_a_new_agent_session_interrupts_the_issue_turn():
+    """A follow-up session's `stop` must reach the turn started by an earlier
+    agent session on the same issue — that only works when both key per-issue."""
+    adapter = _make_adapter()
+    interrupts = []
+
+    async def fake_interrupt(session_key, chat_id):
+        interrupts.append((session_key, chat_id))
+
+    adapter.interrupt_session_activity = fake_interrupt
+
+    issue_key = adapter._session_key_for(extract_context(_prompted_payload(session_id="session-1"), {}))
+    adapter._active_sessions[issue_key] = object()  # the turn session-1 started
+
+    payload = _prompted_payload(session_id="session-2", event_id="evt-stop")
+    payload["agentActivity"]["signal"] = "stop"
+    response, status = await _post(adapter, payload, delivery_id="evt-stop")
+
+    assert status == 200 and response["status"] == "stopped"
+    # Same per-issue key dispatch used, and the chat_id is the issue id.
+    assert interrupts == [(issue_key, "issue-1")]
+
+
+# ---------------------------------------------------------------------------
+# P4 — the stop-signal key is exactly the dispatch key (named profile)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_session_key_for_matches_dispatch_key_with_a_named_profile():
+    adapter = _make_adapter()
+    adapter.set_owner_profile("work")
+    captured = []
+
+    async def capture_background(event, session_key):
+        captured.append(session_key)
+
+    async def message_handler(event):
+        return None
+
+    adapter._message_handler = message_handler
+    adapter._process_message_background = capture_background
+
+    payload = _prompted_payload(event_id="evt-profile")
+    _, status = await _post(adapter, payload, profile="work", delivery_id="evt-profile")
+    await _settle()
+
+    assert status == 200
+    assert captured, "real handle_message never reached background dispatch"
+
+    key = adapter._session_key_for(extract_context(payload, {}), profile="work")
+    assert key == captured[0]
+    # Profile namespacing applied the same way on both paths.
+    assert key.startswith("agent:work:")
+
+
+# ---------------------------------------------------------------------------
+# P5 — strict mutation_policy parsing
+# ---------------------------------------------------------------------------
+
+
+def test_mutation_policy_string_false_disables_the_write():
+    adapter = _make_adapter(
+        extra={"mutation_policy": {"create_comments": "false", "update_issues": "TRUE", "delete_customers": "No"}}
+    )
+
+    assert adapter._mutation_policy["create_comments"] is False
+    assert adapter._mutation_policy["update_issues"] is True
+    assert adapter._mutation_policy["delete_customers"] is False
+
+
+def test_mutation_policy_numeric_strings_convert():
+    adapter = _make_adapter(extra={"mutation_policy": {"create_issues": "1", "create_labels": "0"}})
+    assert adapter._mutation_policy["create_issues"] is True
+    assert adapter._mutation_policy["create_labels"] is False
+
+
+def test_mutation_policy_garbage_value_raises_config_error():
+    with pytest.raises(LinearAgentConfigError) as excinfo:
+        _make_adapter(extra={"mutation_policy": {"update_issues": "maybe"}})
+    assert "update_issues" in str(excinfo.value)
+
+
+def test_mutation_policy_non_string_non_bool_raises_config_error():
+    with pytest.raises(LinearAgentConfigError):
+        _make_adapter(extra={"mutation_policy": {"update_issues": 2}})
+
+
+def test_mutation_policy_unknown_keys_are_not_copied_into_the_policy():
+    adapter = _make_adapter(extra={"mutation_policy": {"create_comment": True, "update_issues": True}})
+    assert "create_comment" not in adapter._mutation_policy
+    assert adapter._mutation_policy["update_issues"] is True
+
+
+# ---------------------------------------------------------------------------
+# P6 — configured workspace: missing id fails closed
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_configured_workspace_rejects_missing_workspace_id():
+    client = _FakeLinearClient()
+    adapter = _make_adapter(client=client, extra={"workspace_id": "workspace-1"})
+    dispatched = []
+
+    async def capture(event):
+        dispatched.append(event)
+
+    adapter.handle_message = capture
+
+    payload = _created_payload()
+    del payload["agentSession"]["workspaceId"]
+    response, status = await _post(adapter, payload, delivery_id="evt-ws-missing")
+
+    assert status == 200
+    assert response["status"] == "ignored"
+    assert response["reason"] == "missing workspace"
+    assert dispatched == []
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_configured_workspace_still_accepts_its_own_workspace():
+    adapter = _make_adapter(extra={"workspace_id": "workspace-1"})
+    dispatched = []
+
+    async def capture(event):
+        dispatched.append(event)
+
+    adapter.handle_message = capture
+
+    response, status = await _post(adapter, _created_payload(), delivery_id="evt-ws-ok")
+
+    assert status == 200
+    assert response["status"] == "accepted"
+    assert len(dispatched) == 1
+
+
+# ---------------------------------------------------------------------------
+# P7 — /p/<profile>/ path validation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_profile_path_mismatch_is_rejected_before_processing():
+    client = _FakeLinearClient()
+    adapter = _make_adapter(client=client)
+    adapter.set_owner_profile("alpha")
+    dispatched = []
+
+    async def capture(event):
+        dispatched.append(event)
+
+    adapter.handle_message = capture
+
+    response, status = await _post(adapter, _created_payload(), profile="beta", delivery_id="evt-beta")
+
+    assert status == 404
+    assert response["error"] == "Unknown profile"
+    assert dispatched == []
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_profile_path_matching_the_own_profile_is_accepted():
+    adapter = _make_adapter()
+    adapter.set_owner_profile("alpha")
+    dispatched = []
+
+    async def capture(event):
+        dispatched.append(event)
+
+    adapter.handle_message = capture
+
+    _, status = await _post(adapter, _created_payload(), profile="alpha", delivery_id="evt-alpha")
+
+    assert status == 200
+    assert len(dispatched) == 1
+
+
+@pytest.mark.asyncio
+async def test_profile_path_fails_closed_when_it_names_another_profile(monkeypatch):
+    """No declared owner profile: only a prefix naming THIS process's profile
+    may pass (single-profile gateway); everything else is a 404."""
+    import hermes_cli.profiles as profiles_mod
+
+    adapter = _make_adapter()
+    assert adapter._own_profile_name() == ""
+    monkeypatch.setattr(profiles_mod, "profile_matches_home", lambda name, home=None: False)
+
+    response, status = await _post(adapter, _created_payload(), profile="someone-else", delivery_id="evt-x")
+
+    assert status == 404
+    assert response["error"] == "Unknown profile"
+
+
+@pytest.mark.asyncio
+async def test_unprefixed_webhook_is_unaffected(monkeypatch):
+    import hermes_cli.profiles as profiles_mod
+
+    adapter = _make_adapter()
+    dispatched = []
+
+    async def capture(event):
+        dispatched.append(event)
+
+    adapter.handle_message = capture
+    monkeypatch.setattr(profiles_mod, "profile_matches_home", lambda name, home=None: False)
+
+    _, status = await _post(adapter, _created_payload(), delivery_id="evt-bare")
+
+    assert status == 200
+    assert len(dispatched) == 1
+
+
+# ---------------------------------------------------------------------------
+# P8 — loopback default bind
+# ---------------------------------------------------------------------------
+
+
+def test_default_bind_host_is_loopback():
+    adapter = _make_adapter()
+    assert DEFAULT_HOST == "127.0.0.1"
+    assert adapter._host == "127.0.0.1"
+
+
+def test_bind_host_is_still_overridable():
+    adapter = _make_adapter(extra={"webhook_host": "0.0.0.0"})
+    assert adapter._host == "0.0.0.0"

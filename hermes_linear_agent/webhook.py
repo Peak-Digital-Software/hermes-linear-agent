@@ -149,6 +149,17 @@ def parse_json_body(raw_body: bytes) -> dict[str, Any]:
     return payload
 
 
+def _body_webhook_timestamp(body: bytes) -> str:
+    """Return the signed ``webhookTimestamp`` body field as a string ("" if absent)."""
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except Exception:  # noqa: BLE001 - unparseable body has no timestamp
+        return ""
+    if not isinstance(payload, Mapping):
+        return ""
+    return _string(payload.get("webhookTimestamp"))
+
+
 def verify_linear_signature(
     headers: Mapping[str, str],
     body: bytes,
@@ -171,19 +182,27 @@ def verify_linear_signature(
         return False
 
     timestamp = _header(headers, *TIMESTAMP_HEADERS)
-    if timestamp:
-        try:
-            ts = int(timestamp)
-        except ValueError:
-            return False
-        # Linear sends Linear-Timestamp/webhookTimestamp as Unix milliseconds
-        # (for example 1676056940508), while Standard Webhooks/Svix style
-        # timestamps are Unix seconds.  Normalize only for freshness checks;
-        # keep the original header string for providers that include it in the
-        # signed payload.
-        ts_seconds = ts / 1000 if ts > 10_000_000_000 else ts
-        if abs(time.time() - ts_seconds) > tolerance_seconds:
-            return False
+    # A signed delivery with no freshness anchor can be replayed forever once
+    # the dedup TTL lapses, so a timestamp is mandatory: header first, then the
+    # signed ``webhookTimestamp`` body field Linear actually sends (Unix ms).
+    freshness = timestamp or _body_webhook_timestamp(body)
+    if not freshness:
+        return False
+    try:
+        ts = int(float(freshness))
+    except (TypeError, ValueError):
+        return False
+    # Linear sends Linear-Timestamp/webhookTimestamp as Unix milliseconds
+    # (for example 1676056940508), while Standard Webhooks/Svix style
+    # timestamps are Unix seconds.  Normalize only for freshness checks;
+    # keep the original header string for providers that include it in the
+    # signed payload.
+    ts_seconds = ts / 1000 if ts > 10_000_000_000 else ts
+    # Header-anchored deliveries are freshness-checked here.  Body-anchored
+    # ones defer the window to is_stale_body_timestamp so the adapter keeps
+    # answering them with its 400 "stale delivery" path.
+    if timestamp and abs(time.time() - ts_seconds) > tolerance_seconds:
+        return False
 
     webhook_id = _header(headers, *WEBHOOK_ID_HEADERS)
 
@@ -229,7 +248,16 @@ def verify_linear_signature(
     supplied = signature.strip()
     pieces = (part.strip() for part in re.split(r"[;,\s]+", supplied))
     parts = list(dict.fromkeys([supplied, *(p for p in pieces if p)]))
-    return any(hmac.compare_digest(part, candidate) for part in parts for candidate in candidates)
+    for part in parts:
+        # hmac.compare_digest raises TypeError on non-ASCII str; such a piece
+        # can never be a hex/base64 digest, so treat it as a non-match rather
+        # than letting a malformed header 500 the webhook endpoint.
+        if not part.isascii():
+            continue
+        for candidate in candidates:
+            if hmac.compare_digest(part, candidate):
+                return True
+    return False
 
 
 def is_stale_body_timestamp(
@@ -240,9 +268,12 @@ def is_stale_body_timestamp(
 ) -> bool:
     """Replay guard for deliveries whose timestamp rides only in the body.
 
-    Header freshness is enforced during signature verification; without a
-    timestamp header, the signed ``webhookTimestamp`` body field is the only
-    thing stopping a captured delivery from replaying after the dedup TTL.
+    Header freshness is enforced during signature verification, which also
+    rejects signed deliveries that carry no timestamp at all; this check is
+    what enforces the signed ``webhookTimestamp`` body field when no timestamp
+    header is present. Without it, a captured delivery could replay after the
+    dedup TTL. Unsigned (explicitly opted-in) deliveries with no timestamp are
+    left alone: there is no signed anchor to trust either way.
     """
     if _header(headers, *TIMESTAMP_HEADERS):
         return False

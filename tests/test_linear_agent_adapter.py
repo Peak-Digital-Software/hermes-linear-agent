@@ -223,6 +223,9 @@ def _signature(raw_body, secret):
 def _headers(raw_body, secret, delivery_id="evt-1"):
     return {
         "Linear-Signature": _signature(raw_body, secret),
+        # Signed deliveries must carry a freshness anchor (see
+        # verify_linear_signature); a timestamp-less signature is rejected.
+        "Linear-Timestamp": str(int(time.time() * 1000)),
         "Linear-Delivery-Id": delivery_id,
     }
 
@@ -818,7 +821,7 @@ async def test_graphql_client_refreshes_after_401_and_retries(monkeypatch):
 def test_webhook_signature_verification_passes_for_valid_signature():
     raw = _body({"hello": "linear"})
     assert verify_linear_signature(
-        {"Linear-Signature": _signature(raw, "secret")},
+        {"Linear-Signature": _signature(raw, "secret"), "Linear-Timestamp": str(int(time.time() * 1000))},
         raw,
         "secret",
     )
@@ -838,7 +841,7 @@ def test_webhook_signature_verification_accepts_sha256_colon_signature():
     digest = hmac.new(b"secret", raw, hashlib.sha256).hexdigest()
 
     assert verify_linear_signature(
-        {"Linear-Signature": f"sha256:{digest}"},
+        {"Linear-Signature": f"sha256:{digest}", "Linear-Timestamp": str(int(time.time() * 1000))},
         raw,
         "secret",
     )
@@ -893,7 +896,10 @@ def test_webhook_signature_verification_accepts_v1_equals_signature():
     signature = "v1=" + base64.b64encode(digest).decode("ascii")
 
     assert verify_linear_signature(
-        {"X-Linear-Webhook-Signature": signature},
+        {
+            "X-Linear-Webhook-Signature": signature,
+            "Linear-Timestamp": str(int(time.time() * 1000)),
+        },
         raw,
         "secret",
     )
@@ -923,7 +929,9 @@ async def test_created_webhook_dispatches_session_and_emits_thought():
     )
     assert len(captured) == 1
     event = captured[0]
-    assert event.source.chat_id == "session-1"
+    # The source is keyed per ISSUE (one Hermes session per issue), not per
+    # Linear agent session; replies resolve back to the session separately.
+    assert event.source.chat_id == "issue-1"
     assert event.source.thread_id == "issue-1"
     assert event.source.user_id == "user-1"
     assert "You were invoked from Linear." in event.text
@@ -951,7 +959,7 @@ async def test_prompted_webhook_routes_followup_to_same_session():
     assert status == 200
     assert response["agent_session_id"] == "session-1"
     assert len(captured) == 1
-    assert captured[0].source.chat_id == "session-1"
+    assert captured[0].source.chat_id == "issue-1"
     assert captured[0].source.thread_id == "issue-1"
     assert captured[0].text == "Can you check the test log too?"
 
@@ -983,8 +991,9 @@ async def test_stop_signal_interrupts_and_confirms_without_dispatch():
         interrupts.append((session_key, chat_id))
 
     adapter.interrupt_session_activity = fake_interrupt
-    # Seed a typing mark so we can assert it is cleared on stop.
-    adapter._typing_marks["session-1"] = 123.0
+    # Seed a typing mark so we can assert it is cleared on stop (keyed by the
+    # issue id, the chat_id the gateway uses).
+    adapter._typing_marks["issue-1"] = 123.0
 
     payload = _stop_prompted_payload()
     raw = _body(payload)
@@ -996,17 +1005,18 @@ async def test_stop_signal_interrupts_and_confirms_without_dispatch():
     assert response["agent_session_id"] == "session-1"
     # No prompt dispatched.
     assert dispatched == []
-    # Interrupt was invoked for this session (chat_id == agent session id).
+    # Interrupt was invoked for this issue's session (the key is per-issue;
+    # the chat_id is the issue id too — the id the gateway keys typing by).
     assert len(interrupts) == 1
-    assert interrupts[0][1] == "session-1"
-    assert interrupts[0][0].endswith("session-1") or "session-1" in interrupts[0][0]
+    assert interrupts[0][1] == "issue-1"
+    assert "issue-1" in interrupts[0][0]
     # Exactly one confirming `response` activity was posted.
     responses = [c for c in fake_client.calls if c[0] == "response"]
     assert len(responses) == 1
     assert responses[0][1] == "session-1"
     assert "Stopped" in responses[0][2]
     # Typing mark cleared.
-    assert "session-1" not in adapter._typing_marks
+    assert "issue-1" not in adapter._typing_marks
 
 
 @pytest.mark.asyncio
@@ -1078,6 +1088,7 @@ async def test_scoped_lock_acquired_on_connect_and_released_on_disconnect(monkey
     """AGENTS.md scoped-lock: connect() takes a per-credential lock and
     disconnect() releases it, so two profiles can't share one credential."""
     import gateway.status as status_mod
+    import gateway.status_scoped_locks as scoped_locks_mod
 
     acquired = []
     released = []
@@ -1090,7 +1101,9 @@ async def test_scoped_lock_acquired_on_connect_and_released_on_disconnect(monkey
         released.append((scope, identity))
 
     monkeypatch.setattr(status_mod, "acquire_scoped_lock", fake_acquire)
-    monkeypatch.setattr(status_mod, "release_scoped_lock", fake_release)
+    # The base adapter releases through gateway.status_scoped_locks (the
+    # acquire half still lives in gateway.status).
+    monkeypatch.setattr(scoped_locks_mod, "release_scoped_lock", fake_release)
 
     # Ephemeral port so the test never collides with a real gateway.
     adapter = _make_adapter(extra={"port": 0})
@@ -1137,9 +1150,11 @@ class _ViewerClient(_FakeLinearClient):
 
 def _lock_free(monkeypatch):
     import gateway.status as status_mod
+    import gateway.status_scoped_locks as scoped_locks_mod
 
     monkeypatch.setattr(status_mod, "acquire_scoped_lock", lambda scope, identity, metadata=None: (True, None))
-    monkeypatch.setattr(status_mod, "release_scoped_lock", lambda scope, identity: None)
+    # release_scoped_lock lives in gateway.status_scoped_locks now.
+    monkeypatch.setattr(scoped_locks_mod, "release_scoped_lock", lambda scope, identity: None)
 
 
 @pytest.mark.asyncio
@@ -1578,8 +1593,10 @@ async def test_final_response_maps_to_agent_activity_create_response():
 async def test_adapter_send_uses_response_activity():
     fake_client = _FakeLinearClient()
     adapter = _make_adapter(client=fake_client)
+    # chat_id is the ISSUE id; the reply resolves to the newest agent session.
+    adapter._latest_agent_session["issue-1"] = "session-1"
 
-    result = await adapter.send("session-1", "Final answer")
+    result = await adapter.send("issue-1", "Final answer")
 
     assert result.success is True
     assert result.message_id == "response-1"
@@ -1760,14 +1777,19 @@ async def test_stale_body_timestamp_is_rejected():
     stale = _created_payload()
     stale["webhookTimestamp"] = int((time.time() - 3600) * 1000)
     raw = _body(stale)
-    response, status = await adapter.handle_webhook(_headers(raw, "secret", delivery_id="evt-stale-1"), raw)
+    # Body-only freshness: strip the (otherwise fresh) timestamp header.
+    stale_headers = _headers(raw, "secret", delivery_id="evt-stale-1")
+    stale_headers.pop("Linear-Timestamp", None)
+    response, status = await adapter.handle_webhook(stale_headers, raw)
     assert status == 400
     assert "Stale" in response["error"]
 
     fresh = _created_payload()
     fresh["webhookTimestamp"] = int(time.time() * 1000)
     raw2 = _body(fresh)
-    _, status2 = await adapter.handle_webhook(_headers(raw2, "secret", delivery_id="evt-stale-2"), raw2)
+    fresh_headers = _headers(raw2, "secret", delivery_id="evt-stale-2")
+    fresh_headers.pop("Linear-Timestamp", None)
+    _, status2 = await adapter.handle_webhook(fresh_headers, raw2)
     assert status2 == 200
 
 
@@ -1780,7 +1802,8 @@ async def test_send_chunks_oversized_responses():
     paragraphs = "\n\n".join(f"paragraph {i} " + "x" * 90 for i in range(600))
     assert len(paragraphs) > adapter.MAX_MESSAGE_LENGTH
 
-    result = await adapter.send("session-1", paragraphs, metadata={})
+    adapter._latest_agent_session["issue-1"] = "session-1"
+    result = await adapter.send("issue-1", paragraphs, metadata={})
 
     assert result.success is True
     responses = [c for c in fake_client.calls if c[0] == "response"]
@@ -1948,7 +1971,8 @@ async def test_reply_in_source_thread_is_mirrored_to_resolved_root_by_adapter():
     assert len(dispatched) == 1
     assert "Reply in the source thread" not in dispatched[0].text
 
-    result = await adapter.send("session-1", "Final answer")
+    # chat_id is the issue id; the reply resolves to the session it recorded.
+    result = await adapter.send("issue-1", "Final answer")
 
     assert result.success is True
     assert client.calls == [
@@ -2213,9 +2237,10 @@ async def test_issue_update_session_replies_as_comment():
     assert status == 200
     assert response["status"] == "accepted"
     assert len(dispatched) == 1
-    assert dispatched[0].source.chat_id == "update:issue-1"
+    # Issue-update turns have no agent session, so they key/reply by issue id.
+    assert dispatched[0].source.chat_id == "issue-1"
 
-    result = await adapter.send("update:issue-1", "Reviewed — looks fine.")
+    result = await adapter.send("issue-1", "Reviewed — looks fine.")
 
     assert result.success is True
     assert fake_client.calls[-1] == (
@@ -2226,7 +2251,7 @@ async def test_issue_update_session_replies_as_comment():
     )
 
     # Error path routes to a comment as well.
-    err = await adapter.send_error_activity("update:issue-1", "Something broke.")
+    err = await adapter.send_error_activity("issue-1", "Something broke.")
     assert err.success is True
     assert fake_client.calls[-1][0] == "comment"
 
@@ -2283,13 +2308,14 @@ async def test_send_clarify_posts_elicitation_activity():
     as awaitingInput; the reply arrives via a `prompted` webhook."""
     fake_client = _FakeLinearClient()
     adapter = _make_adapter(client=fake_client)
+    adapter._latest_agent_session["issue-1"] = "session-1"
 
     result = await adapter.send_clarify(
-        "session-1",
+        "issue-1",
         "Which environment should I target?",
         ["production", "staging"],
         clarify_id="clarify-1",
-        session_key="agent:main:linear_agent:thread:session-1",
+        session_key="agent:main:linear_agent:thread:issue-1:issue-1",
     )
 
     assert result.success is True
@@ -2304,13 +2330,14 @@ async def test_send_clarify_posts_elicitation_activity():
 async def test_send_clarify_open_ended_posts_bare_question():
     fake_client = _FakeLinearClient()
     adapter = _make_adapter(client=fake_client)
+    adapter._latest_agent_session["issue-1"] = "session-1"
 
     result = await adapter.send_clarify(
-        "session-1",
+        "issue-1",
         "What should the project be called?",
         None,
         clarify_id="clarify-2",
-        session_key="agent:main:linear_agent:thread:session-1",
+        session_key="agent:main:linear_agent:thread:issue-1:issue-1",
     )
 
     assert result.success is True
@@ -2323,21 +2350,26 @@ async def test_send_clarify_open_ended_posts_bare_question():
 async def test_send_typing_posts_rate_limited_ephemeral_thought():
     fake_client = _FakeLinearClient()
     adapter = _make_adapter(client=fake_client)
+    adapter._latest_agent_session.update({"issue-1": "session-1", "issue-2": "session-2"})
 
-    await adapter.send_typing("session-1")
-    await adapter.send_typing("session-1")  # within the interval — suppressed
+    await adapter.send_typing("issue-1")
+    await adapter.send_typing("issue-1")  # within the interval — suppressed
 
     thoughts = [c for c in fake_client.calls if c[0] == "thought"]
     assert len(thoughts) == 1
+    assert thoughts[0][1] == "session-1"
     assert fake_client.thought_ephemeral_flags == [True]
 
-    # A different session gets its own indicator.
-    await adapter.send_typing("session-2")
+    # A different issue gets its own indicator (in its own session).
+    await adapter.send_typing("issue-2")
     thoughts = [c for c in fake_client.calls if c[0] == "thought"]
     assert len(thoughts) == 2
+    assert thoughts[1][1] == "session-2"
 
-    # Synthetic issue-update sessions have no Linear session to indicate in.
+    # No known agent session (synthetic issue-update turn, restarted gateway
+    # or cron delivery) — nothing to indicate in, and no failure.
     await adapter.send_typing("update:issue-1")
+    await adapter.send_typing("issue-9")
     thoughts = [c for c in fake_client.calls if c[0] == "thought"]
     assert len(thoughts) == 2
 

@@ -106,7 +106,9 @@ Authorization is two-layer and **fail-closed at both layers**: the gateway grant
 ```yaml
 linear_agent:
   enabled: true
-  webhook_host: 0.0.0.0
+  # Loopback by default. The listener is meant to sit behind a tunnel or
+  # reverse proxy you control (see Local Run); widen this only deliberately.
+  webhook_host: 127.0.0.1
   webhook_port: 8651
   webhook_path: /hermes/linear-agent
   # When set, webhooks from any OTHER workspace are ignored (one Linear app
@@ -181,14 +183,28 @@ https://your-public-host.example/hermes/linear-agent
 
 For local development, expose the configured port with a tunnel and use the tunnel HTTPS URL.
 
+## Peak fork changes
+
+Hardening applied on top of upstream `626b037` (see the `tests/test_peak_*.py` suites):
+
+- **P1 — replay freshness:** a *signed* delivery with no timestamp anywhere (no timestamp header, no signed `webhookTimestamp`) is rejected instead of staying replayable forever.
+- **P2 — signature robustness:** a non-ASCII signature piece is an ordinary invalid signature (401), not a `TypeError` that 500s the endpoint or masks a valid piece.
+- **P3 — one Hermes session per Linear issue:** the source is keyed by the issue (`chat_id`/`thread_id` = issue id), matching `gateway.session.build_session_key`, so a follow-up mention remembers the work done and can interrupt it; replies resolve to the newest Linear agent session on the issue, falling back to an issue comment when none is known.
+- **P4 — stop hits the right turn:** the `stop` signal's interrupt key is derived exactly like dispatch (same source, same flags, same profile namespace).
+- **P5 — strict `mutation_policy`:** only the boolean `true` enables a write; `"false"`/`"no"`/`"0"` strings no longer unlock anything.
+- **P6 — workspace fail-closed:** a webhook that cannot name the configured workspace is treated as foreign and ignored.
+- **P7 — `/p/<profile>/` validation:** a path naming a profile this listener does not serve is a 404, before the body is authenticated or any side effect runs.
+- **P8 — loopback bind:** the webhook listener defaults to `127.0.0.1`, not every interface.
+
 ## Notes
 
+- One Hermes conversation per Linear **issue**, not per Linear agent session: a follow-up mention on the same issue continues the same session (so it remembers the work and can interrupt it), and each reply is posted into the NEWEST agent session on that issue. If the gateway restarted and no session is known yet, the reply posts as an issue comment.
 - Normal Hermes final responses are sent as Linear `response` activities. For comment-mention sessions Linear mirrors the response into the session's thread; mentioning the agent inside an existing thread makes Linear re-anchor the conversation at a new root comment, so the reply appears there rather than in the original thread.
 - New sessions optionally receive a quick `thought` acknowledgement.
 - Dispatch failures are reported as Linear `error` activities.
 - All write tools (issues, comments, projects, status updates, milestones, initiatives, documents, customer needs, releases) are gated by `mutation_policy` and fail closed by default. Agent-session activities (responses/thoughts/errors) are the core protocol and are not gated.
 - Set `LINEAR_AGENT_APP_USER_ID` (or `app_user_id`) so issue-update webhooks triggered by the agent's own mutations are ignored — without it, every write the agent makes echoes back as a new session. When unset, the adapter auto-discovers the id from Linear's `viewer` query at connect (best-effort backstop; setting it explicitly is still recommended).
-- Issue-update webhooks feed auto-start only by default — delegation itself arrives as a real `created` agent session, so dispatching update webhooks as turns too would double-process every delegation. Opt in with `dispatch_issue_updates: true` to react to issue edits; those turns have no agent session, so replies post as issue comments (requires `mutation_policy.create_comments: true`).
+- Issue-update webhooks feed auto-start only by default — delegation itself arrives as a real `created` agent session, so dispatching update webhooks as turns too would double-process every delegation. Opt in with `dispatch_issue_updates: true` to react to issue edits; those turns have no agent session of their own, so replies post as issue comments unless a live agent session is already known for the issue (requires `mutation_policy.create_comments: true` for the comment path).
 - `reply_in_source_thread: true` is an opt-in **workaround** for a Linear limitation: a session response can't render inline in the thread the agent was mentioned from (only the first-party `@Linear` assistant can), so when on, the agent also replies on the mention's source comment. Content then appears in both the session widget and the thread. Default off matches other third-party agents. **Remove this flag** if Linear ships native inline/source-thread replies for third-party agents (see the adapter's `_reply_in_source_thread` comment for the unwind steps).
 - `linear_agent_update_issue`/`create_issue` accept a workflow state NAME (`state: "Done"`) and resolve it to the required `stateId` automatically.
 - MCP parity: `update_issue`/`create_issue` also resolve friendly reference keys (`assignee` by name/email/`me`, `labels`, `project`, `team`, `cycle`, `milestone`, `delegate`) to Linear's `*Id` fields; `null` clears where Linear allows it, and raw `*Id` keys still pass straight through. Ambiguous or unknown names abort BEFORE the mutation and name the lookup tool.

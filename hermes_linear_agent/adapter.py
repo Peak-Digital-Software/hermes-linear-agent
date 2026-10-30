@@ -65,7 +65,11 @@ from .webhook import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_HOST = "0.0.0.0"
+# Loopback by default: the webhook listener is reachable from the public
+# internet through a tunnel/reverse proxy the operator controls, not by
+# binding every interface. Set `webhook_host` (or LINEAR_AGENT_WEBHOOK_HOST)
+# to widen it deliberately.
+DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8651
 DEFAULT_WEBHOOK_PATH = "/hermes/linear-agent"
 DEFAULT_ACK_BODY = "I’m starting work on this."
@@ -238,6 +242,32 @@ def _list_value(value: Any) -> list[str]:
     return []
 
 
+class LinearAgentConfigError(ValueError):
+    """Invalid Linear Agent config; raised at adapter construction (fail closed)."""
+
+
+# The only string spellings a boolean mutation_policy value may use. Anything
+# else raises instead of being coerced: a typo'd policy that silently became
+# True would grant a write the operator never enabled.
+_POLICY_TRUE = frozenset({"true", "yes", "1"})
+_POLICY_FALSE = frozenset({"false", "no", "0"})
+
+
+def _policy_flag(key: str, value: Any) -> bool:
+    """Coerce one ``mutation_policy`` value strictly (bool, or true/false/yes/no/1/0)."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in _POLICY_TRUE:
+            return True
+        if lowered in _POLICY_FALSE:
+            return False
+    raise LinearAgentConfigError(
+        f"[linear_agent] mutation_policy.{key} must be a boolean (true/false/yes/no/1/0), got {value!r}"
+    )
+
+
 def _merge_policy(value: Any) -> dict[str, Any]:
     policy = dict(DEFAULT_MUTATION_POLICY)
     if isinstance(value, dict):
@@ -249,7 +279,11 @@ def _merge_policy(value: Any) -> dict[str, Any]:
                 "[linear_agent] Unknown mutation_policy keys ignored: %s",
                 ", ".join(sorted(unknown)),
             )
-        policy.update(value)
+        # Only known keys are copied, and only after strict coercion: an
+        # unknown key can never smuggle a value into the effective policy.
+        for key in DEFAULT_MUTATION_POLICY:
+            if key in value:
+                policy[key] = _policy_flag(key, value[key])
     return policy
 
 
@@ -524,6 +558,11 @@ class LinearAgentAdapter(BasePlatformAdapter):
         # Agent Session ID -> (issue ID, source thread root comment ID). Routes
         # are consumed exactly once by send(); bounded against abandoned runs.
         self._source_thread_routes: dict[str, tuple[str, str]] = {}
+        # Issue ID -> NEWEST Linear Agent Session ID seen on it. The Hermes
+        # session (and every outbound chat_id) is keyed per ISSUE while Linear
+        # mints a fresh agent session per mention, so replies are resolved
+        # through this map to land in the current session.
+        self._latest_agent_session: dict[str, str] = {}
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not AIOHTTP_AVAILABLE:
@@ -647,6 +686,54 @@ class LinearAgentAdapter(BasePlatformAdapter):
             return agent_session_id[len("update:") :] or None
         return None
 
+    def _remember_agent_session(self, context: LinearWebhookContext) -> None:
+        """Track the NEWEST Linear agent session per issue, before dispatch.
+
+        Linear mints a fresh agent session for every mention on an issue, while
+        the Hermes session (and every outbound ``chat_id``) is keyed per ISSUE
+        (see ``_build_source``). Recording the session on every accepted
+        created/prompted webhook keeps replies in the current session instead
+        of the first one that ever touched the issue.
+        """
+        if context.action not in ("created", "prompted"):
+            return
+        agent_session_id = str(context.agent_session_id or "").strip()
+        issue_id = str(context.issue_id or "").strip()
+        if not agent_session_id or not issue_id or self._issue_reply_target(agent_session_id):
+            return
+        if len(self._latest_agent_session) >= 512 and issue_id not in self._latest_agent_session:
+            self._latest_agent_session.clear()  # unbounded-growth guard
+        self._latest_agent_session[issue_id] = agent_session_id
+
+    def _reply_target(self, chat_id: str, metadata: dict[str, Any] | None = None) -> tuple[str, str]:
+        """Resolve an outbound ``chat_id`` (the ISSUE id) to a reply target.
+
+        Returns ``(agent_session_id, issue_id)`` with at most one non-empty:
+        the newest Linear agent session seen on that issue (→ Agent Activity),
+        otherwise the issue id itself (→ issue comment). The comment fallback
+        covers turns with no Linear session at all (synthetic issue-update
+        sessions, cron/``LINEAR_AGENT_HOME_TARGET`` delivery) and a restarted
+        gateway whose in-memory per-issue map is empty — replying somewhere
+        beats failing the turn.
+        """
+        explicit = str((metadata or {}).get("linear_agent_session_id") or "").strip()
+        if explicit:
+            synthetic_issue = self._issue_reply_target(explicit)
+            return ("", synthetic_issue) if synthetic_issue else (explicit, "")
+        chat_id = str(chat_id or "").strip()
+        if not chat_id:
+            return "", ""
+        synthetic_issue = self._issue_reply_target(chat_id)
+        if synthetic_issue:
+            return "", synthetic_issue
+        agent_session_id = self._latest_agent_session.get(chat_id)
+        if agent_session_id:
+            return agent_session_id, chat_id
+        if chat_id in self._latest_agent_session.values():
+            # A bare agent-session id (direct caller, restored state).
+            return chat_id, ""
+        return "", chat_id
+
     async def _send_issue_comment(self, issue_id: str, content: str) -> SendResult:
         try:
             comment = await self._client.create_comment(
@@ -676,14 +763,20 @@ class LinearAgentAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send the final Hermes response to Linear.
 
-        Real agent sessions get a ``response`` Agent Activity; synthetic
-        issue-update sessions get a comment on the triggering issue.
+        ``chat_id`` is the ISSUE id (the Hermes session is keyed per issue, see
+        ``_build_source``). The reply becomes a ``response`` Agent Activity in
+        the newest Linear agent session seen on that issue; without a known
+        session (restart, cron/home delivery, synthetic issue-update turns) it
+        posts as a comment on the issue instead.
         """
-        agent_session_id = str((metadata or {}).get("linear_agent_session_id") or chat_id or "").strip()
+        agent_session_id, issue_id = self._reply_target(chat_id, metadata)
         if not agent_session_id:
-            return SendResult(success=False, error="Missing Linear Agent Session ID")
-        issue_id = self._issue_reply_target(agent_session_id)
-        if issue_id:
+            if not issue_id:
+                return SendResult(success=False, error="Missing Linear Agent Session ID")
+            logger.info(
+                "[linear_agent] No live agent session for issue %s; posting the reply as an issue comment",
+                issue_id,
+            )
             return await self._send_issue_comment(issue_id, content)
         activity: dict[str, Any] = {}
         chunks = _split_message(content, self.MAX_MESSAGE_LENGTH)
@@ -731,9 +824,16 @@ class LinearAgentAdapter(BasePlatformAdapter):
             raw_response={"agent_activity": activity, "source_comment": source_reply} if source_reply else activity,
         )
 
-    async def send_error_activity(self, agent_session_id: str, body: str) -> SendResult:
-        issue_id = self._issue_reply_target(agent_session_id)
-        if issue_id:
+    async def send_error_activity(self, chat_id: str, body: str) -> SendResult:
+        """Report a failed turn as an ``error`` Agent Activity.
+
+        ``chat_id`` is resolved like every other outbound path (issue id →
+        newest agent session id, comment fallback when there is none).
+        """
+        agent_session_id, issue_id = self._reply_target(chat_id)
+        if not agent_session_id:
+            if not issue_id:
+                return SendResult(success=False, error="Missing Linear Agent Session ID")
             return await self._send_issue_comment(issue_id, body)
         try:
             activity = await self._client.create_error(agent_session_id, body)
@@ -763,10 +863,11 @@ class LinearAgentAdapter(BasePlatformAdapter):
         ``prompted`` webhook and the gateway text-intercept resolves the
         clarify, exactly like the base text-fallback path.
         """
-        agent_session_id = str((metadata or {}).get("linear_agent_session_id") or chat_id or "").strip()
-        if not agent_session_id or self._issue_reply_target(agent_session_id):
-            # Synthetic issue-update sessions have no Linear session to
-            # elicit in; fall back to the base text rendering (→ comment).
+        agent_session_id, _issue_id = self._reply_target(chat_id, metadata)
+        if not agent_session_id:
+            # No Linear session to elicit in (synthetic issue-update turns, or
+            # unknown after a restart): fall back to the base text rendering,
+            # which the base send path posts as an issue comment.
             return await super().send_clarify(chat_id, question, choices, clarify_id, session_key, metadata=metadata)
 
         if choices:
@@ -814,21 +915,62 @@ class LinearAgentAdapter(BasePlatformAdapter):
         renders as a transient status line and is replaced by the next
         activity — Linear's AIG asks for exactly this kind of immediate,
         unobtrusive feedback. Rate-limited so the typing heartbeat doesn't
-        spam the session timeline.
+        spam the session timeline. ``chat_id`` is the issue id: it resolves to
+        the newest agent session on that issue, and is a no-op when there is
+        none (nothing to show a working state in).
         """
-        session_id = str(chat_id or "").strip()
-        if not session_id or self._issue_reply_target(session_id):
+        session_id, issue_id = self._reply_target(chat_id, metadata)
+        if not session_id:
             return
+        # Rate-limit per ISSUE (the session granularity): a follow-up agent
+        # session on the same issue must not reset the indicator, and stop
+        # clears it with the same chat_id the gateway uses.
+        mark_key = issue_id or session_id
         now = time.time()
-        if now - self._typing_marks.get(session_id, 0.0) < self.TYPING_THOUGHT_INTERVAL:
+        if now - self._typing_marks.get(mark_key, 0.0) < self.TYPING_THOUGHT_INTERVAL:
             return
         if len(self._typing_marks) > 256:  # unbounded-growth guard
             self._typing_marks.clear()
-        self._typing_marks[session_id] = now
+        self._typing_marks[mark_key] = now
         try:
             await self._client.create_thought(session_id, "Working on it…", ephemeral=True)
         except Exception:  # noqa: BLE001 - typing is best-effort
             logger.debug("[linear_agent] Working-state thought failed", exc_info=True)
+
+    def _own_profile_name(self) -> str:
+        """This adapter's own Hermes profile name ("" when the gateway never named one)."""
+        for attr in ("_owner_profile", "_hermes_profile_name"):
+            value = getattr(self, attr, None)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    def _accepts_profile_path(self, profile: str | None) -> bool:
+        """True when a ``/p/<profile>/hermes/linear-agent`` prefix names THIS adapter.
+
+        The prefix exists so a shared multiplexed listener can reach a named
+        profile's app. On a single-profile listener a different profile names a
+        bot this process does not serve — serving it here would run another
+        profile's traffic under this profile's credentials and allowlists — so
+        it fails closed.
+        """
+        name = str(profile or "").strip()
+        if not name:
+            return True
+        own = self._own_profile_name()
+        if own:
+            return name == own
+        try:
+            from hermes_cli.profiles import profile_matches_home
+
+            return bool(profile_matches_home(name))
+        except Exception:  # noqa: BLE001 - unimportable profile helpers must fail closed
+            logger.warning(
+                "[linear_agent] Cannot verify URL profile %r (profile helpers unavailable); rejecting",
+                name,
+                exc_info=True,
+            )
+            return False
 
     async def _handle_health(self, request: web.Request) -> web.Response:
         return web.json_response({"status": "ok", "platform": "linear_agent"})
@@ -858,6 +1000,17 @@ class LinearAgentAdapter(BasePlatformAdapter):
         *,
         profile: str | None = None,
     ) -> tuple[dict[str, Any], int]:
+        # A /p/<profile>/ prefix must name THIS adapter's profile before the
+        # body is authenticated or anything else happens (see
+        # _accepts_profile_path): an unknown/foreign profile is a 404.
+        if not self._accepts_profile_path(profile):
+            logger.warning(
+                "[linear_agent] Rejecting webhook for URL profile %r: this adapter serves %r",
+                profile,
+                self._own_profile_name() or "the active profile",
+            )
+            return {"error": "Unknown profile"}, 404
+
         if self._webhook_secret:
             if not verify_linear_signature(headers, raw_body, self._webhook_secret):
                 logger.warning(
@@ -915,9 +1068,16 @@ class LinearAgentAdapter(BasePlatformAdapter):
         # Workspace restriction: one Linear app (and webhook secret) can be
         # installed in multiple workspaces, so a valid signature does not
         # imply the configured workspace. Enforced before authorization and
-        # all side effects; 200 so Linear doesn't retry legitimate traffic
-        # from the app's other workspaces.
-        if self._workspace_id and context.workspace_id and context.workspace_id != self._workspace_id:
+        # all side effects, and fail closed: a delivery that cannot name the
+        # configured workspace is treated as foreign. 200 so Linear doesn't
+        # retry legitimate traffic from the app's other workspaces.
+        if self._workspace_id and context.workspace_id != self._workspace_id:
+            if not context.workspace_id:
+                logger.warning(
+                    "[linear_agent] Ignoring webhook with no workspace id (configured workspace: %s)",
+                    self._workspace_id,
+                )
+                return {"status": "ignored", "reason": "missing workspace"}, 200
             logger.warning(
                 "[linear_agent] Ignoring webhook from workspace %s (configured workspace: %s)",
                 context.workspace_id,
@@ -954,6 +1114,11 @@ class LinearAgentAdapter(BasePlatformAdapter):
                 "status": "duplicate",
                 "delivery_id": context.delivery_id,
             }, 200
+
+        # Record the newest agent session on this issue BEFORE any reply path
+        # can run (dispatch, stop confirmation, ack): the Hermes session and
+        # every outbound chat_id are per ISSUE, so replies resolve through it.
+        self._remember_agent_session(context)
 
         # Human→agent "stop" signal: halt immediately, make no further writes
         # beyond the required confirmation, and do NOT dispatch the activity
@@ -1012,7 +1177,7 @@ class LinearAgentAdapter(BasePlatformAdapter):
         except Exception as exc:  # noqa: BLE001 - send an Agent Activity error when possible
             logger.exception("[linear_agent] Dispatch failed for session %s", context.agent_session_id)
             await self.send_error_activity(
-                context.agent_session_id,
+                context.issue_id or context.agent_session_id,
                 f"The assistant failed to process this Linear Agent Session: {exc}",
             )
             # 200: the delivery itself was handled (Linear retries non-200,
@@ -1240,16 +1405,30 @@ class LinearAgentAdapter(BasePlatformAdapter):
     def _build_source(self, context: LinearWebhookContext, *, profile: str | None = None):
         """Build the SessionSource for a Linear context.
 
-        Shared by dispatch and the stop-signal interrupt so both agree on the
-        exact session identity (and therefore the same session key).
+        ``chat_id`` is the ISSUE id, NOT the Linear agent session id. Linear
+        mints a fresh agent session for every mention on an issue, so keying
+        the Hermes session on it would give each follow-up a brand-new session
+        — no memory of the work already done, and no way for a follow-up to
+        interrupt its own predecessor. The gateway derives its session key from
+        the source (``gateway.session.build_session_key``), so the issue id
+        must be in ``chat_id`` for the store, the busy path and the interrupt
+        path to agree.
+
+        ``thread_id`` repeats the issue id on purpose: ``build_session_key``
+        keys a THREAD as one shared session (per-user isolation only via
+        ``thread_sessions_per_user``), which is what "one Hermes session per
+        issue" means — every authorized user on the issue shares it unless the
+        operator opts into per-user thread sessions. Replies are resolved back
+        to the newest Linear agent session by ``_reply_target``.
         """
+        session_id = context.thread_id or context.agent_session_id
         source = self.build_source(
-            chat_id=context.agent_session_id,
+            chat_id=session_id,
             chat_name=context.chat_name,
             chat_type="thread",
             user_id=context.actor_user_id or self._app_user_id,
             user_name=context.actor_user_name or "Linear user",
-            thread_id=context.thread_id,
+            thread_id=session_id or None,
             guild_id=context.workspace_id or self._workspace_id,
             message_id=context.delivery_id,
         )
@@ -1260,18 +1439,12 @@ class LinearAgentAdapter(BasePlatformAdapter):
     def _session_key_for(self, context: LinearWebhookContext, *, profile: str | None = None) -> str:
         """Reconstruct the session key that handle_message uses for dispatch.
 
-        Mirrors BasePlatformAdapter.handle_message's build_session_key call
-        (same grouping flags, same source shape — including profile — as the
-        dispatch path) so the interrupt targets the same _active_sessions
-        entry the running turn holds.
+        Routes through the base adapter's ``_source_session_key`` (identity
+        canonicalization, grouping flags and profile namespacing) exactly like
+        the gateway runner's own key derivation, so the interrupt targets the
+        ``_active_sessions`` entry the running turn holds.
         """
-        from gateway.session import build_session_key
-
-        return build_session_key(
-            self._build_source(context, profile=profile),
-            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
-            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-        )
+        return super()._source_session_key(self._build_source(context, profile=profile))
 
     async def _handle_stop_signal(
         self, context: LinearWebhookContext, *, profile: str | None = None
@@ -1283,26 +1456,29 @@ class LinearAgentAdapter(BasePlatformAdapter):
         200 so Linear records the stop as handled.
         """
         session_id = context.agent_session_id
+        # Same source (hence same key and same chat_id) dispatch uses.
+        source = self._build_source(context, profile=profile)
         # Interrupt the running turn via the base adapter's own interrupt API
         # (sets the session's interrupt Event and stops typing); no-op if no
         # turn is active, which keeps stop idempotent.
         try:
-            session_key = self._session_key_for(context, profile=profile)
+            session_key = super()._source_session_key(source)
             had_active_turn = session_key in getattr(self, "_active_sessions", {})
             logger.info(
                 "[linear_agent] Stop signal for session %s (active turn: %s)",
                 session_id,
                 had_active_turn,
             )
-            await self.interrupt_session_activity(session_key, session_id)
+            # chat_id is the ISSUE id — the same id the gateway keys typing by.
+            await self.interrupt_session_activity(session_key, source.chat_id)
         except Exception:  # noqa: BLE001 - stop must still confirm even if interrupt fails
             logger.warning(
                 "[linear_agent] Failed to interrupt session %s on stop signal",
                 session_id,
                 exc_info=True,
             )
-        # Stop the typing heartbeat for this session.
-        self._typing_marks.pop(session_id, None)
+        # Stop the typing heartbeat for this issue.
+        self._typing_marks.pop(str(source.chat_id or session_id), None)
         # Emit the single confirming final activity Linear requires on stop.
         try:
             await self._client.create_response(

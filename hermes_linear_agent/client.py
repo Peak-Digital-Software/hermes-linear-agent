@@ -54,9 +54,12 @@ def _require_policy(
     """Raise unless the mutation policy explicitly enables `key`.
 
     Every write method must call this before executing its mutation so that
-    all writes fail closed when the operator has not opted in.
+    all writes fail closed when the operator has not opted in. Only the exact
+    boolean ``True`` enables a gate: config values arrive as raw YAML/env
+    strings, so any non-empty value (``"false"``, ``"true"``, ``"no"``) must
+    not silently unlock writes.
     """
-    if not (mutation_policy or {}).get(key, False):
+    if (mutation_policy or {}).get(key) is not True:
         raise LinearApiError(f"{what} is disabled by mutation_policy (enable '{key}')")
 
 
