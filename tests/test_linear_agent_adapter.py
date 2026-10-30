@@ -1600,7 +1600,9 @@ async def test_final_response_maps_to_agent_activity_create_response():
 
 @pytest.mark.asyncio
 async def test_create_response_passes_signal_metadata_only_when_set():
+    # Real create_response (the capture client above stubs it); only execute is faked.
     client = _CaptureGraphQLClient()
+    client.create_response = lambda *a, **k: LinearGraphQLClient.create_response(client, *a, **k)
     options = {"options": [{"label": "a", "value": "a"}]}
 
     await client.create_response("session-1", "Pick", response_type="elicitation", signal="select", signal_metadata=options)
