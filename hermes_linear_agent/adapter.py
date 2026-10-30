@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
+import json
 import logging
 import os
 import re
@@ -74,6 +77,13 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8651
 DEFAULT_WEBHOOK_PATH = "/hermes/linear-agent"
 DEFAULT_ACK_BODY = "I’m starting work on this."
+# Loopback wake endpoint. Deliberately OUTSIDE the webhook path and without a
+# /p/<profile> variant: it is a local control-plane hook for a co-located
+# service (peak-agent), authorized by an HMAC over the raw body — never by the
+# user allowlist — so it must not be reachable through the public webhook URL.
+DEFAULT_WAKE_PATH = "/internal/wake"
+WAKE_MAX_SKEW_SECONDS = 300
+WAKE_TEXT_PREFIX = "[peak-agent wake] "
 # Agent-to-agent handoff cap. A peer session is accepted only while the issue
 # still has at most this many app-initiated sessions; beyond it a human has to
 # take over (two agents can otherwise ping an issue back and forth forever).
@@ -371,6 +381,7 @@ def _env_enablement() -> dict[str, Any] | None:
         seed["access_token"] = token
     for env_name, key in (
         ("LINEAR_AGENT_WEBHOOK_SECRET", "webhook_secret"),
+        ("LINEAR_AGENT_WAKE_SECRET", "wake_secret"),
         ("LINEAR_AGENT_APP_USER_ID", "app_user_id"),
         ("LINEAR_AGENT_WORKSPACE_ID", "workspace_id"),
         ("LINEAR_AGENT_CLIENT_ID", "client_id"),
@@ -508,6 +519,9 @@ class LinearAgentAdapter(BasePlatformAdapter):
         self._webhook_path = _normalize_path(extra.get("webhook_path"))
         self._access_token = _resolve_access_token(config.token, extra)
         self._webhook_secret = str(extra.get("webhook_secret") or _str_env("LINEAR_AGENT_WEBHOOK_SECRET") or "").strip()
+        # Loopback wake HMAC secret. Unset means the wake endpoint is disabled
+        # (503): it never falls back to the webhook secret or to unsigned mode.
+        self._wake_secret = str(extra.get("wake_secret") or _str_env("LINEAR_AGENT_WAKE_SECRET") or "").strip()
         self._allow_unsigned_webhooks = _bool_opt(
             extra,
             "allow_unsigned_webhooks",
@@ -598,6 +612,20 @@ class LinearAgentAdapter(BasePlatformAdapter):
         # through this map to land in the current session.
         self._latest_agent_session: dict[str, str] = {}
 
+    def _build_app(self):
+        """The listener's routes, built once by ``connect`` (and by tests).
+
+        ``/internal/wake`` lives at the app root — NOT under ``_webhook_path``
+        and with no ``/p/<profile>`` variant — so the public webhook URL (and
+        the profile-prefixed mirror of it) can never reach the wake handler.
+        """
+        app = web.Application(client_max_size=self._max_body_bytes)
+        app.router.add_get("/health", self._handle_health)
+        app.router.add_post(DEFAULT_WAKE_PATH, self._handle_wake)
+        app.router.add_post(self._webhook_path, self._handle_webhook)
+        app.router.add_post(f"/p/{{profile}}{self._webhook_path}", self._handle_webhook)
+        return app
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not AIOHTTP_AVAILABLE:
             logger.warning("[linear_agent] aiohttp is not installed")
@@ -626,10 +654,7 @@ class LinearAgentAdapter(BasePlatformAdapter):
         # client_max_size: aiohttp's own body cap (default 1 MiB) must track
         # the configured limit, or larger configured payloads 500 inside
         # request.read() instead of 413ing at the explicit check.
-        app = web.Application(client_max_size=self._max_body_bytes)
-        app.router.add_get("/health", self._handle_health)
-        app.router.add_post(self._webhook_path, self._handle_webhook)
-        app.router.add_post(f"/p/{{profile}}{self._webhook_path}", self._handle_webhook)
+        app = self._build_app()
 
         self._runner = web.AppRunner(app)
         await self._runner.setup()
@@ -1085,6 +1110,131 @@ class LinearAgentAdapter(BasePlatformAdapter):
             logger.exception("[linear_agent] Unhandled webhook failure")
             return web.json_response({"error": "Webhook handling failed"}, status=500)
         return web.json_response(body, status=status)
+
+    # ------------------------------------------------------------------
+    # Loopback wake endpoint — POST /internal/wake
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _wake_signature(secret: str, timestamp: str, raw_body: bytes) -> str:
+        """Lowercase hex HMAC-SHA256(secret, f"{timestamp}.{raw_body}").
+
+        ``timestamp`` is the header value exactly as sent, so the signature
+        covers the same bytes the caller signed.
+        """
+        message = f"{timestamp}.".encode() + raw_body
+        return hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
+
+    def _check_wake_auth(self, headers: Any, raw_body: bytes) -> tuple[dict[str, Any], int] | None:
+        """Verify the wake signature and freshness; None means authorized."""
+        timestamp_raw = str(headers.get("X-Wake-Timestamp") or "").strip()
+        signature = str(headers.get("X-Wake-Signature") or "").strip().lower()
+        try:
+            timestamp = int(timestamp_raw)
+        except (TypeError, ValueError):
+            return {"error": "Invalid wake timestamp"}, 401
+        if abs(time.time() - timestamp) > WAKE_MAX_SKEW_SECONDS:
+            return {"error": "Stale wake request"}, 401
+        expected = self._wake_signature(self._wake_secret, timestamp_raw, raw_body)
+        try:
+            if not hmac.compare_digest(expected, signature):
+                return {"error": "Invalid wake signature"}, 401
+        except TypeError:
+            # A non-ASCII signature header is an ordinary invalid signature,
+            # never a 500 that hides the real check (same precedent as P2).
+            return {"error": "Invalid wake signature"}, 401
+        return None
+
+    async def _handle_wake(self, request: web.Request) -> web.Response:
+        """Dispatch one agent turn for an issue, authorized by HMAC only.
+
+        Order matters: disabled (503) before anything else, then the body cap,
+        then the signature/timestamp check (401) BEFORE the body is parsed, so
+        an unauthenticated caller can never reach the JSON parser.
+        """
+        # Fail closed: no secret configured means the endpoint does not exist
+        # for callers — never fall back to the webhook secret or unsigned mode.
+        if not self._wake_secret:
+            return web.json_response({"error": "wake disabled"}, status=503)
+
+        content_length = request.content_length or 0
+        if content_length > self._max_body_bytes:
+            return web.json_response({"error": "Payload too large"}, status=413)
+        raw_body = await request.read()
+        if len(raw_body) > self._max_body_bytes:
+            return web.json_response({"error": "Payload too large"}, status=413)
+
+        rejected = self._check_wake_auth(request.headers, raw_body)
+        if rejected is not None:
+            body, status = rejected
+            logger.warning("[linear_agent] Rejected wake request: %s", body.get("error"))
+            return web.json_response(body, status=status)
+
+        try:
+            payload = json.loads(raw_body)
+        except (UnicodeDecodeError, ValueError):
+            return web.json_response({"error": "Invalid JSON body"}, status=400)
+        if not isinstance(payload, dict):
+            return web.json_response({"error": "Invalid JSON body"}, status=400)
+
+        issue_id = payload.get("issue_id")
+        text = payload.get("text")
+        issue_key = payload.get("issue_key")
+        if not isinstance(issue_id, str) or not issue_id.strip():
+            return web.json_response({"error": "issue_id is required"}, status=400)
+        if not isinstance(text, str) or not text.strip():
+            return web.json_response({"error": "text is required"}, status=400)
+        issue_key = issue_key.strip() if isinstance(issue_key, str) else ""
+
+        self._dispatch_wake(issue_id.strip(), issue_key, text)
+        logger.info(
+            "[linear_agent] Wake dispatched for issue %s (key=%s)",
+            issue_id.strip(),
+            issue_key or "-",
+        )
+        return web.json_response({"status": "dispatched"}, status=202)
+
+    def _wake_context(self, issue_id: str, issue_key: str) -> LinearWebhookContext:
+        """A Linear context for a wake: no Linear actor, so the session's
+        ``user_id`` is this app and its sender evidence is the signature."""
+        return LinearWebhookContext(
+            action="prompted",
+            delivery_id=f"wake-{issue_id}-{time.time_ns()}",
+            agent_session_id="",
+            workspace_id=self._workspace_id,
+            issue_id=issue_id,
+            issue_identifier=issue_key,
+            # chat_name falls back to the issue id when no key was supplied.
+            issue_title=issue_id if not issue_key else "",
+            actor_user_name="peak-agent wake",
+            sender_source="wake",
+        )
+
+    def _dispatch_wake(self, issue_id: str, issue_key: str, text: str) -> None:
+        """Queue the wake turn; the HTTP call answers 202 immediately."""
+        context = self._wake_context(issue_id, issue_key)
+        source = self._build_source(context)
+        event = MessageEvent(
+            text=WAKE_TEXT_PREFIX + text,
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message={"linear": context.metadata(), "wake": {"issue_key": issue_key}},
+            message_id=context.delivery_id,
+            auto_skill=list(self._auto_skills) if self._auto_skills else None,
+            # A system turn: authorized by the HMAC above, so the gateway must
+            # skip user/allowlist authorization (gateway/run_inbound.py and
+            # gateway/platforms/base.py both return early for internal events).
+            internal=True,
+        )
+        task = asyncio.create_task(self._run_wake_turn(event))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _run_wake_turn(self, event: MessageEvent) -> None:
+        try:
+            await self.handle_message(event)
+        except Exception:  # noqa: BLE001 - background task must never raise into the loop
+            logger.exception("[linear_agent] Wake turn failed for %s", event.source.chat_id)
 
     async def handle_webhook(
         self,
