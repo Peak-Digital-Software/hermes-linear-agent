@@ -1599,6 +1599,20 @@ async def test_final_response_maps_to_agent_activity_create_response():
 
 
 @pytest.mark.asyncio
+async def test_create_response_passes_signal_metadata_only_when_set():
+    client = _CaptureGraphQLClient()
+    options = {"options": [{"label": "a", "value": "a"}]}
+
+    await client.create_response("session-1", "Pick", response_type="elicitation", signal="select", signal_metadata=options)
+    await client.create_response("session-1", "Pick", response_type="elicitation", signal="select")
+
+    with_meta, without_meta = (variables["input"] for _, variables in client.operations)
+    assert with_meta["signal"] == "select"
+    assert with_meta["signalMetadata"] == options
+    assert "signalMetadata" not in without_meta
+
+
+@pytest.mark.asyncio
 async def test_adapter_send_uses_response_activity():
     fake_client = _FakeLinearClient()
     adapter = _make_adapter(client=fake_client)
