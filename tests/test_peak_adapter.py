@@ -455,3 +455,19 @@ def test_default_bind_host_is_loopback():
 def test_bind_host_is_still_overridable():
     adapter = _make_adapter(extra={"webhook_host": "0.0.0.0"})
     assert adapter._host == "0.0.0.0"
+
+
+def test_str_env_reads_the_profile_secret_scope(monkeypatch):
+    """P9: under multiplexing a profile's .env lives only in its secret scope."""
+    import gateway.platforms._shared as shared
+
+    from hermes_linear_agent import adapter as adapter_mod
+
+    monkeypatch.delenv("LINEAR_AGENT_CLIENT_ID", raising=False)
+    monkeypatch.setattr(
+        shared,
+        "get_scoped_secret",
+        lambda name, default=None, **_: {"LINEAR_AGENT_CLIENT_ID": " scoped-id "}.get(name, default),
+    )
+    assert adapter_mod._str_env("LINEAR_AGENT_CLIENT_ID") == "scoped-id"
+    assert adapter_mod._str_env("LINEAR_AGENT_MISSING") == ""

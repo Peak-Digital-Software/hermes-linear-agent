@@ -106,7 +106,14 @@ MAX_MESSAGE_LENGTH = 40_000
 
 
 def _str_env(name: str) -> str:
-    return os.getenv(name, "").strip()
+    """Profile-scoped env read: under gateway.multiplex_profiles a profile's .env
+    lives only in its secret scope, so os.getenv would miss it (or read the
+    default profile's value)."""
+    try:
+        from gateway.platforms._shared import get_scoped_secret
+    except ImportError:  # older Hermes without secret scopes
+        return os.getenv(name, "").strip()
+    return str(get_scoped_secret(name, "", external_fallback=True) or "").strip()
 
 
 def _first_secret(extra: dict[str, Any], key: str, env_name: str) -> str:
