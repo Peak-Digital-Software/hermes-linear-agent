@@ -58,7 +58,16 @@ class _FakeLinearClient:
         self.thought_ephemeral_flags.append(ephemeral)
         return {"id": "thought-1"}
 
-    async def create_response(self, agent_session_id, body, *, response_type="response", ephemeral=False, signal=None):
+    async def create_response(
+        self,
+        agent_session_id,
+        body,
+        *,
+        response_type="response",
+        ephemeral=False,
+        signal=None,
+        signal_metadata=None,
+    ):
         # Keyed by activity type so elicitation is distinguishable from a
         # normal response; the default keeps existing tuple assertions valid.
         self.calls.append((response_type, agent_session_id, body))
@@ -88,7 +97,7 @@ class _CaptureGraphQLClient(LinearGraphQLClient):
         }
 
     async def create_response(
-        self, agent_session_id, content, *, response_type="response", ephemeral=False, signal=None
+        self, agent_session_id, content, *, response_type="response", ephemeral=False, signal=None, signal_metadata=None
     ):
         # Record both the logical call and the exact variables shape the real
         # implementation sends, so existing assertions continue to pass.
