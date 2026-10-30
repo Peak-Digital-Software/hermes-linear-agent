@@ -30,6 +30,8 @@ from hermes_linear_agent.webhook import extract_context
 class _FakeLinearClient:
     def __init__(self):
         self.calls = []
+        # Full create_response payloads (P16 elicitation signal assertions)
+        self.activities = []
         # issue id -> agent session nodes (P12 handoff count / P13 recovery)
         self.agent_sessions = {}
         # agent session id -> comment author id (P12 sender fallback)
@@ -58,8 +60,27 @@ class _FakeLinearClient:
         self.calls.append(("thought", agent_session_id, body))
         return {"id": "thought-1"}
 
-    async def create_response(self, agent_session_id, body, *, response_type="response", ephemeral=False, signal=None):
+    async def create_response(
+        self,
+        agent_session_id,
+        body,
+        *,
+        response_type="response",
+        ephemeral=False,
+        signal=None,
+        signal_metadata=None,
+    ):
         self.calls.append((response_type, agent_session_id, body))
+        self.activities.append(
+            {
+                "agent_session_id": agent_session_id,
+                "body": body,
+                "response_type": response_type,
+                "ephemeral": ephemeral,
+                "signal": signal,
+                "signal_metadata": signal_metadata,
+            }
+        )
         return {"id": "response-1"}
 
     async def create_error(self, agent_session_id, body):
@@ -956,3 +977,113 @@ async def test_prompted_self_echo_is_still_refused_even_with_an_allowed_issue_cr
 
     assert status == 403
     assert events == []
+
+
+# ---------------------------------------------------------------------------
+# P16 — clarify: `select` elicitations carry signalMetadata.options, and the
+# elicitation recovers the issue's session after a restart
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_clarify_with_choices_sends_select_signal_with_one_option_per_choice():
+    client = _FakeLinearClient()
+    adapter = _make_adapter(client=client, extra={"app_user_id": "app-1"})
+    adapter._latest_agent_session["issue-1"] = "session-1"
+
+    result = await adapter.send_clarify(
+        "issue-1",
+        "Which package should change?",
+        ["frontend", "backend"],
+        "clarify-1",
+        "session-key",
+    )
+
+    assert result.success is True
+    assert len(client.activities) == 1
+    activity = client.activities[0]
+    assert activity["agent_session_id"] == "session-1"
+    assert activity["response_type"] == "elicitation"
+    assert activity["signal"] == "select"
+    assert activity["signal_metadata"] == {
+        "options": [
+            {"label": "frontend", "value": "frontend"},
+            {"label": "backend", "value": "backend"},
+        ]
+    }
+    # The numbered list stays in the body as the free-text fallback.
+    assert "1. frontend" in activity["body"]
+    assert "2. backend" in activity["body"]
+
+
+
+@pytest.mark.asyncio
+async def test_clarify_without_choices_sends_a_plain_elicitation():
+    client = _FakeLinearClient()
+    adapter = _make_adapter(client=client, extra={"app_user_id": "app-1"})
+    adapter._latest_agent_session["issue-1"] = "session-1"
+
+    result = await adapter.send_clarify(
+        "issue-1",
+        "What should the timeout be?",
+        None,
+        "clarify-1",
+        "session-key",
+    )
+
+    assert result.success is True
+    assert len(client.activities) == 1
+    activity = client.activities[0]
+    assert activity["response_type"] == "elicitation"
+    assert activity["signal"] is None
+    assert activity["signal_metadata"] is None
+
+
+@pytest.mark.asyncio
+async def test_clarify_recovers_the_newest_own_agent_session_after_a_restart():
+    client = _FakeLinearClient()
+    client.agent_sessions["issue-1"] = [
+        {"id": "session-own-old", "createdAt": "2026-01-01T00:00:00.000Z", "appUser": {"id": "app-1"}},
+        {"id": "session-other", "createdAt": "2026-01-01T00:05:00.000Z", "appUser": {"id": "app-other"}},
+        {"id": "session-own-new", "createdAt": "2026-01-01T00:02:00.000Z", "appUser": {"id": "app-1"}},
+    ]
+    adapter = _make_adapter(client=client, extra={"app_user_id": "app-1"})
+    assert adapter._latest_agent_session == {}
+
+    result = await adapter.send_clarify(
+        "issue-1",
+        "Which package should change?",
+        ["frontend", "backend"],
+        "clarify-1",
+        "session-key",
+    )
+
+    assert result.success is True
+    # The elicitation goes into the recovered session, not an issue comment.
+    assert [call[0] for call in client.calls] == ["elicitation"]
+    assert len(client.activities) == 1
+    assert client.activities[0]["agent_session_id"] == "session-own-new"
+    assert client.activities[0]["signal"] == "select"
+
+
+@pytest.mark.asyncio
+async def test_clarify_falls_back_to_the_base_text_path_when_there_is_no_session_at_all():
+    client = _FakeLinearClient()
+    adapter = _make_adapter(
+        client=client,
+        extra={"app_user_id": "app-1", "mutation_policy": {"create_comments": True}},
+    )
+    assert adapter._latest_agent_session == {}
+
+    result = await adapter.send_clarify(
+        "issue-1",
+        "Which package should change?",
+        ["frontend", "backend"],
+        "clarify-1",
+        "session-key",
+    )
+
+    assert result.success is True
+    assert client.activities == []
+    assert [call[0] for call in client.calls] == ["comment"]
+    assert client.calls[0][1] == "issue-1"

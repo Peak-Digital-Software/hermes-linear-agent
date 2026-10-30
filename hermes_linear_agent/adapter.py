@@ -867,6 +867,23 @@ class LinearAgentAdapter(BasePlatformAdapter):
             raw_response=comment,
         )
 
+    async def _resolve_reply_session(
+        self, chat_id: str, metadata: dict[str, Any] | None = None
+    ) -> tuple[str, str]:
+        """Resolve ``(agent_session_id, issue_id)`` for an outbound reply.
+
+        Tries the in-memory per-issue map first, then recovers this app's
+        newest Linear agent session on the issue (P13) — a restarted gateway
+        starts with an empty map. Returns at most one non-empty id: a session
+        (→ Agent Activity) or the issue (→ issue comment).
+        """
+        agent_session_id, issue_id = self._reply_target(chat_id, metadata)
+        if not agent_session_id and issue_id and self._recoverable_reply_target(chat_id, metadata):
+            recovered = await self._recover_reply_session(issue_id)
+            if recovered:
+                agent_session_id, issue_id = recovered, ""
+        return agent_session_id, issue_id
+
     async def send(
         self,
         chat_id: str,
@@ -883,11 +900,7 @@ class LinearAgentAdapter(BasePlatformAdapter):
         issue-update turns) it re-derives this app's newest session on the
         issue from Linear, and only then posts as an issue comment.
         """
-        agent_session_id, issue_id = self._reply_target(chat_id, metadata)
-        if not agent_session_id and issue_id and self._recoverable_reply_target(chat_id, metadata):
-            recovered = await self._recover_reply_session(issue_id)
-            if recovered:
-                agent_session_id, issue_id = recovered, ""
+        agent_session_id, issue_id = await self._resolve_reply_session(chat_id, metadata)
         if not agent_session_id:
             if not issue_id:
                 return SendResult(success=False, error="Missing Linear Agent Session ID")
@@ -981,13 +994,14 @@ class LinearAgentAdapter(BasePlatformAdapter):
         ``prompted`` webhook and the gateway text-intercept resolves the
         clarify, exactly like the base text-fallback path.
         """
-        agent_session_id, _issue_id = self._reply_target(chat_id, metadata)
+        agent_session_id, _issue_id = await self._resolve_reply_session(chat_id, metadata)
         if not agent_session_id:
-            # No Linear session to elicit in (synthetic issue-update turns, or
-            # unknown after a restart): fall back to the base text rendering,
-            # which the base send path posts as an issue comment.
+            # No Linear session anywhere (synthetic issue-update turns, or none
+            # Linear can name after a restart): fall back to the base text
+            # rendering, which the base send path posts as an issue comment.
             return await super().send_clarify(chat_id, question, choices, clarify_id, session_key, metadata=metadata)
 
+        signal_metadata: dict[str, Any] | None = None
         if choices:
             lines = [question, ""]
             for i, choice in enumerate(choices, start=1):
@@ -995,6 +1009,9 @@ class LinearAgentAdapter(BasePlatformAdapter):
             lines.append("")
             lines.append("Reply with the number, the option text, or your own answer.")
             body = "\n".join(lines)
+            # `select` renders one option per entry; without signalMetadata
+            # Linear shows no option UI at all (P16).
+            signal_metadata = {"options": [{"label": choice, "value": choice} for choice in choices]}
         else:
             body = question
 
@@ -1006,6 +1023,7 @@ class LinearAgentAdapter(BasePlatformAdapter):
                 body,
                 response_type="elicitation",
                 signal="select" if choices else None,
+                signal_metadata=signal_metadata,
             )
         except Exception as exc:  # noqa: BLE001 - adapter boundary returns SendResult
             logger.warning("[linear_agent] Failed to create elicitation activity: %s", exc)

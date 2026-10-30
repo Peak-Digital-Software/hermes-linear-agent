@@ -1327,6 +1327,7 @@ mutation AgentSessionUpdate($id: String!, $input: AgentSessionUpdateInput!) {
         response_type: str = "response",
         ephemeral: bool = False,
         signal: str | None = None,
+        signal_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Create an agent activity response for a Linear Agent session.
 
@@ -1335,14 +1336,18 @@ mutation AgentSessionUpdate($id: String!, $input: AgentSessionUpdateInput!) {
 
         `ephemeral=True` makes the activity disappear once the next activity
         arrives (useful for acks/progress thoughts); `signal` passes a Linear
-        agent signal (e.g. "stop") alongside the activity.
+        agent signal (e.g. "stop") alongside the activity; `signal_metadata`
+        is that signal's payload (e.g. ``{"options": [...]}`` for ``select``),
+        omitted entirely when None.
         """
         input_payload = build_activity_input(agent_session_id, response_type, content)
-        # ephemeral/signal live at the input level, not inside content.
+        # ephemeral/signal/signalMetadata live at the input level, not inside content.
         if ephemeral:
             input_payload["ephemeral"] = True
         if signal:
             input_payload["signal"] = signal
+        if signal_metadata is not None:
+            input_payload["signalMetadata"] = signal_metadata
         return await self._mutate(
             AGENT_ACTIVITY_CREATE_MUTATION,
             {"input": input_payload},

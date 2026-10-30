@@ -58,7 +58,16 @@ class _FakeLinearClient:
         self.thought_ephemeral_flags.append(ephemeral)
         return {"id": "thought-1"}
 
-    async def create_response(self, agent_session_id, body, *, response_type="response", ephemeral=False, signal=None):
+    async def create_response(
+        self,
+        agent_session_id,
+        body,
+        *,
+        response_type="response",
+        ephemeral=False,
+        signal=None,
+        signal_metadata=None,
+    ):
         # Keyed by activity type so elicitation is distinguishable from a
         # normal response; the default keeps existing tuple assertions valid.
         self.calls.append((response_type, agent_session_id, body))
@@ -88,7 +97,7 @@ class _CaptureGraphQLClient(LinearGraphQLClient):
         }
 
     async def create_response(
-        self, agent_session_id, content, *, response_type="response", ephemeral=False, signal=None
+        self, agent_session_id, content, *, response_type="response", ephemeral=False, signal=None, signal_metadata=None
     ):
         # Record both the logical call and the exact variables shape the real
         # implementation sends, so existing assertions continue to pass.
@@ -1587,6 +1596,22 @@ async def test_final_response_maps_to_agent_activity_create_response():
         "type": "response",
         "body": "Done.",
     }
+
+
+@pytest.mark.asyncio
+async def test_create_response_passes_signal_metadata_only_when_set():
+    # Real create_response (the capture client above stubs it); only execute is faked.
+    client = _CaptureGraphQLClient()
+    client.create_response = lambda *a, **k: LinearGraphQLClient.create_response(client, *a, **k)
+    options = {"options": [{"label": "a", "value": "a"}]}
+
+    await client.create_response("session-1", "Pick", response_type="elicitation", signal="select", signal_metadata=options)
+    await client.create_response("session-1", "Pick", response_type="elicitation", signal="select")
+
+    with_meta, without_meta = (variables["input"] for _, variables in client.operations)
+    assert with_meta["signal"] == "select"
+    assert with_meta["signalMetadata"] == options
+    assert "signalMetadata" not in without_meta
 
 
 @pytest.mark.asyncio
