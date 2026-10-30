@@ -1134,6 +1134,25 @@ mutation AgentSessionUpdate($id: String!, $input: AgentSessionUpdateInput!) {
         session = data.get("agentSession") or {}
         return str(((session.get("comment") or {}).get("user") or {}).get("id") or "").strip()
 
+    async def get_issue_creator_user_id(self, issue_id: str) -> str:
+        """Creator id of an issue ("" when unavailable).
+
+        An agent session's webhook payload serializes the issue without its
+        creator, and a session started by an automation rule names no human
+        anywhere else in the payload: the issue's creator is then the only
+        evidence of who the work is for (P14).
+        """
+        q = """
+        query IssueCreator($id: String!) {
+          issue(id: $id) {
+            creator { id }
+          }
+        }
+        """
+        data = await self.execute(q, {"id": issue_id})
+        issue = data.get("issue") or {}
+        return str((issue.get("creator") or {}).get("id") or "").strip()
+
     async def get_comment_thread_root_id(self, comment_id: str) -> str | None:
         """Return the root comment ID for a root or child comment.
 

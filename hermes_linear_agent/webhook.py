@@ -35,7 +35,23 @@ class LinearWebhookContext:
     # created, but the session's comment still names the originating app user,
     # which is the only sender evidence in that payload (see P12).
     comment_user_id: str = ""
+    # Author serialized on the agentActivity itself (prompted events), kept
+    # separately because it is sometimes THIS app: Linear prompts a session it
+    # created for us (automation rule / delegation) as our own app user, which
+    # is not a sender at all (see P14).
+    activity_user_id: str = ""
+    # ``agentSession.creatorId``: the human responsible for the session, unset
+    # when the session was started by an automation or an agent app.
+    session_creator_id: str = ""
+    # Issue creator, when the payload happens to serialize it (the agent
+    # session's issue payload does not; other shapes may). Used as the last
+    # sender fallback after a GraphQL lookup (see P14).
+    issue_creator_id: str = ""
     actor_user_id: str = ""
+    # Which payload field produced ``actor_user_id`` ("agentActivity.userId",
+    # "agentSession.creatorId", "payload.actor", ...), so the adapter can tell
+    # a real sender from this app prompting its own session.
+    sender_source: str = ""
     actor_user_name: str = ""
     team_id: str = ""
     prompt_context: str = ""
@@ -401,6 +417,8 @@ def extract_context(
             prompt_context="",
             guidance="",
             user_request="",
+            issue_creator_id=_string(data.get("creatorId") or _get_path(data, "creator", "id")),
+            sender_source="payload.actor" if _string(actor.get("id") or payload.get("actorUserId")) else "",
             issue_delegate_id=delegate_id,
             issue_delegate_known=delegate_known,
         )
@@ -444,6 +462,34 @@ def extract_context(
     # against payload-shape drift.
     signal = _string(agent_activity.get("signal") or payload.get("signal")).lower()
 
+    # Linear's AgentSessionEventWebhookPayload names the sender
+    # agentActivity.user/userId (prompted) and agentSession.creator/
+    # creatorId (created); actor/user are older shapes kept as fallbacks.
+    # Each candidate is kept separately with the field it came from: for a
+    # `created` session the activity author can be THIS app (Linear prompts the
+    # session on our behalf), and that is "no sender", not a sender to reject,
+    # so the adapter has to know which field won and continue resolving (P14).
+    activity_user_id = _string(
+        _get_path(activity_actor, "id")
+        or _get_path(agent_activity, "userId")
+        or _get_path(agent_activity, "user", "id")
+    )
+    session_creator_id = _string(_get_path(session, "creatorId") or _get_path(session, "creator", "id"))
+    # Precedence is unchanged from P10 (payload.actor, then the activity
+    # author, then the session creator, then the flat actor fields); only the
+    # source is now recorded so the adapter can tell a machine prompt apart
+    # from a real sender.
+    actor_user_id, sender_source = "", ""
+    for candidate_source, candidate in (
+        ("payload.actor", _string(_get_path(actor, "id"))),
+        ("agentActivity.userId", activity_user_id),
+        ("agentSession.creatorId", session_creator_id),
+        ("payload.actorUserId", _string(payload.get("actorUserId") or _get_path(payload, "user", "id"))),
+    ):
+        if candidate:
+            actor_user_id, sender_source = candidate, candidate_source
+            break
+
     return LinearWebhookContext(
         action=action,
         delivery_id=extract_delivery_id(payload, headers),
@@ -466,19 +512,11 @@ def extract_context(
             or _get_path(session, "comment", "userId")
             or _get_path(payload, "comment", "userId")
         ),
-        # Linear's AgentSessionEventWebhookPayload names the sender
-        # agentActivity.user/userId (prompted) and agentSession.creator/
-        # creatorId (created); actor/user are older shapes kept as fallbacks.
-        actor_user_id=_string(
-            actor.get("id")
-            or activity_actor.get("id")
-            or agent_activity.get("userId")
-            or _get_path(agent_activity, "user", "id")
-            or session.get("creatorId")
-            or _get_path(session, "creator", "id")
-            or payload.get("actorUserId")
-            or _get_path(payload, "user", "id")
-        ),
+        activity_user_id=activity_user_id,
+        session_creator_id=session_creator_id,
+        issue_creator_id=_string(_get_path(issue, "creatorId") or _get_path(issue, "creator", "id")),
+        actor_user_id=actor_user_id,
+        sender_source=sender_source,
         actor_user_name=_string(
             actor.get("name")
             or activity_actor.get("name")

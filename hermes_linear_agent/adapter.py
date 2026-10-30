@@ -1335,41 +1335,107 @@ class LinearAgentAdapter(BasePlatformAdapter):
         self._source_thread_routes[context.agent_session_id] = (context.issue_id, root_id)
 
     async def _resolve_sender(self, context: LinearWebhookContext) -> LinearWebhookContext:
-        """Fill a missing sender from the session's comment (P12).
+        """Resolve the sender for a session that does not name a usable one.
 
-        A session another agent app created carries no ``agentActivity.userId``
-        and no ``agentSession.creatorId`` — Linear leaves the creator null for
-        machine handoffs — so the sender would otherwise resolve to nothing
-        (and an earlier version resolved it to the receiving app itself). The
-        session's comment author is the originating app user. The webhook
-        payload normally serializes it as ``agentSession.comment.userId``;
-        when it does not, fetch it from Linear. A failed fetch leaves the
-        sender empty, which the fail-closed authorization then rejects.
+        Resolution order (P12 for handoffs, P14 for automation-rule
+        delegation): ``agentActivity.userId`` (unless it is this app acting as
+        Linear's machine prompt on a ``created`` session), then
+        ``agentSession.creatorId``, then the session comment's author
+        (payload field, else a Linear lookup), then the issue's creator
+        (payload field, else a Linear lookup).
+
+        Linear leaves the session creator null both for machine handoffs
+        (another agent app is the real sender, readable from the session's
+        comment) and for sessions started by an automation rule or delegation
+        (the issue's creator is the human the work is for). Failing to resolve
+        anything — including a failed lookup — leaves the sender empty, which
+        the fail-closed authorization then rejects.
         """
-        if context.actor_user_id:
-            return context
         if context.action not in ("created", "prompted") or self._issue_reply_target(context.agent_session_id):
             return context
-        comment_user_id = context.comment_user_id
-        if not comment_user_id:
+
+        sender = str(context.actor_user_id or "").strip()
+        source = context.sender_source or ("agentActivity.userId" if sender else "")
+        if (
+            sender
+            and context.action == "created"
+            and source == "agentActivity.userId"
+            and self._app_user_id
+            and sender == self._app_user_id
+        ):
+            # A Linear automation rule / delegation starts the session for
+            # this app and Linear authors the opening prompt as our own app
+            # user: that activity is the machine prompt, not a sender, so keep
+            # resolving. On any other action the same value is our own activity
+            # echoing back and must stay a rejected sender.
+            logger.info(
+                "[linear_agent] Session %s was prompted by this app itself "
+                "(automation rule or delegation); not treating the activity author as a sender",
+                context.agent_session_id,
+            )
+            sender, source = "", ""
+
+        if not sender:
+            sender, source = str(context.session_creator_id or "").strip(), "agentSession.creatorId"
+        if not sender:
+            sender = str(context.comment_user_id or "").strip()
+            if not sender:
+                try:
+                    sender = str(
+                        await self._client.get_agent_session_comment_user_id(context.agent_session_id) or ""
+                    ).strip()
+                except Exception as exc:  # noqa: BLE001 - unresolved sender must stay unauthorized
+                    logger.warning(
+                        "[linear_agent] Could not resolve the comment author for session %s: %s",
+                        context.agent_session_id,
+                        exc,
+                    )
+                    sender = ""
+            if sender:
+                source = "agentSession.comment.userId"
+        if not sender:
+            sender, source = await self._issue_creator_sender(context)
+
+        if not sender:
+            logger.info(
+                "[linear_agent] Session %s names no sender (activity, creator, comment and issue creator all unresolved); refusing",
+                context.agent_session_id,
+            )
+            return context
+        logger.info(
+            "[linear_agent] Session %s sender resolved to %s from %s",
+            context.agent_session_id,
+            sender,
+            source or "unknown",
+        )
+        return replace(context, actor_user_id=sender, sender_source=source)
+
+    async def _issue_creator_sender(self, context: LinearWebhookContext) -> tuple[str, str]:
+        """Sender from the issue's creator (P14), or ``("", "")``.
+
+        The agent-session payload serializes the issue without its creator, so
+        this normally costs one GraphQL lookup. A creator that is this app
+        itself is not a sender: leave it empty so authorization fails closed
+        instead of accepting the app's own id.
+        """
+        issue_id = str(context.issue_id or "").strip()
+        if not issue_id:
+            return "", ""
+        creator_id = str(context.issue_creator_id or "").strip()
+        if not creator_id:
             try:
-                comment_user_id = await self._client.get_agent_session_comment_user_id(context.agent_session_id)
+                creator_id = str(await self._client.get_issue_creator_user_id(issue_id) or "").strip()
             except Exception as exc:  # noqa: BLE001 - unresolved sender must stay unauthorized
                 logger.warning(
-                    "[linear_agent] Could not resolve the comment author for session %s: %s",
+                    "[linear_agent] Could not resolve the creator of issue %s for session %s: %s",
+                    issue_id,
                     context.agent_session_id,
                     exc,
                 )
-                return context
-        comment_user_id = str(comment_user_id or "").strip()
-        if not comment_user_id:
-            return context
-        logger.info(
-            "[linear_agent] Session %s has no creator; sender resolved to comment author %s",
-            context.agent_session_id,
-            comment_user_id,
-        )
-        return replace(context, actor_user_id=comment_user_id)
+                return "", ""
+        if not creator_id or creator_id == self._app_user_id:
+            return "", ""
+        return creator_id, "issue.creatorId"
 
     def _is_peer_sender(self, context: LinearWebhookContext) -> bool:
         """True when the sender is a listed peer app (and not ourselves)."""
@@ -1461,6 +1527,17 @@ class LinearAgentAdapter(BasePlatformAdapter):
         fail-closed check decides alone.
         """
         sender = str(context.actor_user_id or "").strip()
+        # An agent-session event whose sender could not be resolved (no
+        # activity author we may trust, no creator, no comment author, no issue
+        # creator, or a failed lookup) fails closed even under
+        # ``allow_all_users``: "all users" grants humans, not an anonymous
+        # session (P14).
+        if not sender and context.action in ("created", "prompted"):
+            logger.warning(
+                "[linear_agent] Rejecting webhook for session %s: no sender could be resolved",
+                context.agent_session_id,
+            )
+            return False
         # Our own app user is never a valid sender: a session the agent
         # created for itself (or a handoff it addressed to itself) must not
         # re-enter as new work, whatever the allowlists say.

@@ -34,7 +34,10 @@ class _FakeLinearClient:
         self.agent_sessions = {}
         # agent session id -> comment author id (P12 sender fallback)
         self.comment_users = {}
+        # issue id -> creator id (P14 sender fallback)
+        self.issue_creators = {}
         self.agent_sessions_error = None
+        self.issue_creator_error = None
 
     async def list_issue_agent_sessions(self, issue_id, limit=50):
         if self.agent_sessions_error:
@@ -45,6 +48,11 @@ class _FakeLinearClient:
         if self.agent_sessions_error:
             raise self.agent_sessions_error
         return self.comment_users.get(agent_session_id, "")
+
+    async def get_issue_creator_user_id(self, issue_id):
+        if self.issue_creator_error:
+            raise self.issue_creator_error
+        return self.issue_creators.get(issue_id, "")
 
     async def create_thought(self, agent_session_id, body, *, ephemeral=False):
         self.calls.append(("thought", agent_session_id, body))
@@ -782,3 +790,169 @@ async def test_send_does_not_recover_for_a_synthetic_issue_update_target():
 
     assert result.success is True
     assert [call[0] for call in client.calls] == ["comment"]
+
+
+# ---------------------------------------------------------------------------
+# P14 — a session started by a Linear automation rule resolves to the issue's
+# creator (Linear authors the opening prompt as our own app user, so the
+# agentActivity.userId is the machine prompt, not a sender)
+# ---------------------------------------------------------------------------
+
+
+def _rule_delegated_payload(
+    event_id="evt-rule",
+    *,
+    session_id="session-rule",
+    issue_id="issue-1",
+    activity_user_id="app-1",
+    creator_id=None,
+    comment_user_id=None,
+):
+    """A `created` session an automation rule delegated to this app.
+
+    Matches the live shape: ``agentSession.creator`` is null, no session
+    comment, and the only activity is the machine prompt authored by this app.
+    """
+    payload = {
+        "action": "created",
+        "id": event_id,
+        "promptContext": "Work on LIN-123",
+        "agentSession": {
+            "id": session_id,
+            "workspaceId": "workspace-1",
+            "status": "pending",
+            "creator": None,
+            "issue": {
+                "id": issue_id,
+                "identifier": "LIN-123",
+                "title": "Fix the flaky job",
+                "team": {"id": "team-1"},
+            },
+        },
+        "agentActivity": {
+            "id": "activity-1",
+            "userId": activity_user_id,
+            "content": {"type": "prompt", "body": "Work on LIN-123"},
+            "user": {"id": activity_user_id, "name": "Hermes"},
+        },
+    }
+    if creator_id:
+        payload["agentSession"]["creatorId"] = creator_id
+    if comment_user_id:
+        payload["agentSession"]["comment"] = {"id": "comment-1", "userId": comment_user_id}
+    return payload
+
+
+def _rule_adapter(client, **extra):
+    base = {"app_user_id": "app-1", "allow_all_users": False}
+    base.update(extra)
+    return _make_adapter(client=client, extra=base)
+
+
+def test_extract_context_keeps_the_activity_author_and_creator_apart():
+    context = extract_context(_rule_delegated_payload(), {})
+    assert context.actor_user_id == "app-1"
+    assert context.sender_source == "agentActivity.userId"
+    assert context.activity_user_id == "app-1"
+    assert context.session_creator_id == ""
+    assert context.issue_creator_id == ""
+
+
+@pytest.mark.asyncio
+async def test_rule_delegated_session_takes_its_sender_from_the_issue_creator():
+    """ENG-2216: the rule's opening prompt is authored by our own app; the
+    sender is the human who created the issue."""
+    client = _FakeLinearClient()
+    client.issue_creators["issue-1"] = "tom-1"
+    adapter = _rule_adapter(client, allowed_users=["tom-1"])
+    events = await _capture_events(adapter)
+
+    _, status = await _post(adapter, _rule_delegated_payload(), delivery_id="evt-rule")
+    await _settle()
+
+    assert status == 200
+    assert [event.source.user_id for event in events] == ["tom-1"]
+
+
+@pytest.mark.asyncio
+async def test_rule_delegated_session_refuses_an_unknown_issue_creator():
+    client = _FakeLinearClient()
+    client.issue_creators["issue-1"] = "stranger-9"
+    adapter = _rule_adapter(client, allowed_users=["tom-1"])
+    events = await _capture_events(adapter)
+
+    _, status = await _post(adapter, _rule_delegated_payload(), delivery_id="evt-rule")
+    await _settle()
+
+    assert status == 403
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_rule_delegated_session_refuses_when_the_issue_creator_is_this_app():
+    client = _FakeLinearClient()
+    client.issue_creators["issue-1"] = "app-1"
+    # Even "allow every user" must not accept our own app as the sender.
+    adapter = _rule_adapter(client, allow_all_users=True, allowed_users=["app-1"])
+    events = await _capture_events(adapter)
+
+    _, status = await _post(adapter, _rule_delegated_payload(), delivery_id="evt-rule")
+    await _settle()
+
+    assert status == 403
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_rule_delegated_peer_issue_creator_goes_through_the_handoff_cap():
+    client = _FakeLinearClient()
+    client.issue_creators["issue-1"] = "peer-1"
+    client.agent_sessions["issue-1"] = [
+        _app_session(f"session-{i}", created_at=f"2026-01-01T00:0{i}:00.000Z") for i in range(3)
+    ]
+    adapter = _rule_adapter(client, peer_app_user_ids=["peer-1"])
+    events = await _capture_events(adapter)
+
+    response, status = await _post(adapter, _rule_delegated_payload(), delivery_id="evt-rule")
+    await _settle()
+
+    assert status == 200
+    assert response["status"] == "refused"
+    assert events == []
+    assert [call[0] for call in client.calls] == ["response"]
+    assert "already has 3 agent-to-agent handoffs" in client.calls[0][2]
+
+
+@pytest.mark.asyncio
+async def test_rule_delegated_session_refuses_when_the_issue_creator_lookup_fails():
+    client = _FakeLinearClient()
+    client.issue_creator_error = RuntimeError("linear is down")
+    adapter = _rule_adapter(client, allowed_users=["tom-1"])
+    events = await _capture_events(adapter)
+
+    _, status = await _post(adapter, _rule_delegated_payload(), delivery_id="evt-rule")
+    await _settle()
+
+    assert status == 403
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_prompted_self_echo_is_still_refused_even_with_an_allowed_issue_creator():
+    """P14 only reinterprets the activity author on `created`; our own activity
+    echoing back as a prompted event stays a rejected sender."""
+    client = _FakeLinearClient()
+    client.issue_creators["issue-1"] = "tom-1"
+    adapter = _make_adapter(
+        client=client,
+        extra={"app_user_id": "app-1", "allow_all_users": True, "allowed_users": ["tom-1"]},
+    )
+    events = await _capture_events(adapter)
+
+    payload = _prompted_payload()
+    payload["agentActivity"]["actor"] = {"id": "app-1", "name": "Hermes"}
+    _, status = await _post(adapter, payload, delivery_id="evt-echo")
+    await _settle()
+
+    assert status == 403
+    assert events == []
