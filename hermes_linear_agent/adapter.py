@@ -88,6 +88,24 @@ WAKE_TEXT_PREFIX = "[peak-agent wake] "
 # still has at most this many app-initiated sessions; beyond it a human has to
 # take over (two agents can otherwise ping an issue back and forth forever).
 DEFAULT_MAX_AGENT_HANDOFFS = 2
+# ── Core clarify text-fallback suppression (P17) ──────────────────────────────
+# Core's clarify lane re-sends the prompt as plain text when it classifies the
+# native send "failed". On Linear the native send SUCCEEDS (we post a real
+# `elicitation`), but core then raises `stale_generation` from
+# `register_clarify`, so the fallback renders "❓ <question>\n..." through
+# `BasePlatformAdapter.send_clarify` → our `send()` and posts a `response`
+# activity, which makes Linear mark the session complete (ENG-2222/ENG-2223).
+# The prefix comes from the i18n key `gateway.clarify.question`.
+CLARIFY_FALLBACK_PREFIX = "\u2753 "
+# How recent the elicitation must be for the fallback to count as a duplicate of
+# it. Core's fallback fires immediately after the failed disposition, so seconds.
+CLARIFY_FALLBACK_SUPPRESS_SECONDS = 10.0
+
+
+def _clarify_now() -> float:
+    """Monotonic clock for the clarify-suppression window (tests monkeypatch this)."""
+    return time.monotonic()
+
 # All write operations fail closed: each key must be explicitly enabled.
 # `update_projects` also covers project updates (status updates), milestones,
 # and initiatives — project-structure mutations share one umbrella key.
@@ -611,6 +629,9 @@ class LinearAgentAdapter(BasePlatformAdapter):
         # mints a fresh agent session per mention, so replies are resolved
         # through this map to land in the current session.
         self._latest_agent_session: dict[str, str] = {}
+        # Issue ID -> (question.strip(), monotonic timestamp) for the elicitation
+        # we just posted, so `send()` can drop core's duplicate text fallback.
+        self._clarify_elicitations: dict[str, tuple[str, float]] = {}
 
     def _build_app(self):
         """The listener's routes, built once by ``connect`` (and by tests).
@@ -884,6 +905,51 @@ class LinearAgentAdapter(BasePlatformAdapter):
                 agent_session_id, issue_id = recovered, ""
         return agent_session_id, issue_id
 
+    def _note_clarify_elicitation(self, chat_id: str, question: str) -> None:
+        """Remember the elicitation we just posted for this chat (issue) id.
+
+        Core's clarify lane replays the same question as plain text when it
+        classifies the native send as failed, and that text replay reaches
+        ``send()``. Keeping the posted question lets ``send()`` recognise the
+        replay instead of posting a second ``response`` activity.
+        """
+        registry = getattr(self, "_clarify_elicitations", None)
+        if registry is None:
+            registry = {}
+            self._clarify_elicitations = registry
+        if len(registry) >= 256 and chat_id not in registry:  # unbounded-growth guard
+            registry.clear()
+        registry[str(chat_id or "")] = (str(question or "").strip(), _clarify_now())
+
+    def _is_clarify_text_fallback(self, chat_id: str, content: str, metadata: dict | None) -> bool:
+        """True when ``content`` is core's plain-text replay of a clarify elicitation.
+
+        All of these must hold, because the same ``is_approval_prompt`` metadata
+        marks the exec-approval text fallback: the metadata flag, the "❓ "
+        rendering prefix, a recorded elicitation for this chat, the recorded
+        question leading the rendered text, and a recent timestamp. A match
+        consumes the entry — one suppression per elicitation.
+        """
+        if not isinstance(metadata, dict) or not metadata.get("is_approval_prompt"):
+            return False
+        if not isinstance(content, str) or not content.startswith(CLARIFY_FALLBACK_PREFIX):
+            return False
+        registry = getattr(self, "_clarify_elicitations", None)
+        if not registry:
+            return False
+        key = str(chat_id or "")
+        entry = registry.get(key)
+        if entry is None:
+            return False
+        question, posted_at = entry
+        if _clarify_now() - posted_at > CLARIFY_FALLBACK_SUPPRESS_SECONDS:
+            registry.pop(key, None)  # stale: a later clarify may reuse the issue id
+            return False
+        if not content[len(CLARIFY_FALLBACK_PREFIX):].startswith(question):
+            return False
+        registry.pop(key, None)
+        return True
+
     async def send(
         self,
         chat_id: str,
@@ -900,6 +966,15 @@ class LinearAgentAdapter(BasePlatformAdapter):
         issue-update turns) it re-derives this app's newest session on the
         issue from Linear, and only then posts as an issue comment.
         """
+        # FIRST, before any session recovery or state change: core's clarify
+        # lane replays a successfully-posted elicitation as plain text, and that
+        # response activity makes Linear mark the session complete (P17).
+        if self._is_clarify_text_fallback(chat_id, content, metadata):
+            logger.info(
+                "[linear_agent] Suppressed core clarify text fallback for %s (elicitation already posted)",
+                chat_id,
+            )
+            return SendResult(success=True)
         agent_session_id, issue_id = await self._resolve_reply_session(chat_id, metadata)
         if not agent_session_id:
             if not issue_id:
@@ -1035,6 +1110,9 @@ class LinearAgentAdapter(BasePlatformAdapter):
             from tools.clarify_gateway import mark_awaiting_text
 
             mark_awaiting_text(clarify_id)
+        # Also remember the question: core may replay it as plain text through
+        # send() when its own registration of this prompt fails (P17).
+        self._note_clarify_elicitation(chat_id, question)
         return SendResult(
             success=True,
             message_id=str(activity.get("id") or ""),
@@ -2230,6 +2308,109 @@ def interactive_setup() -> None:
     print("  4. Restart the gateway, then @-mention the agent on an issue.")
 
 
+# ── Platform hint, gated on the linear_agent_* toolset (P17) ──────────────────
+# The hint is a plain string on PlatformEntry (gateway/platform_registry.py:88),
+# so the gate is decided once at register(): toggling the toolset needs a
+# gateway restart. The three pieces concatenate to the pre-P17 hint byte for
+# byte; build_platform_hint drops only LINEAR_AGENT_TOOLSET_HINT.
+PLATFORM_HINT_BASE_BEFORE = (
+    "You are responding in a Linear Agent Session. Your final response "
+    "text is delivered directly into the session's Linear thread — put "
+    "the ACTUAL content of your reply there, never a narration like "
+    "'posted X in the thread'. Do NOT use linear_agent_create_comment "
+    "to talk to the user in the CURRENT session; that duplicates the "
+    "conversation and buries your reply. Comment tools are for OTHER "
+    "issues, when the user explicitly asks for a comment, or when a "
+    "'Reply in the source thread' instruction is present in your prompt "
+    "(then follow it exactly). To ask "
+    "the user something, ask directly in your response (or via your "
+    "clarify tool) — the session waits for their reply. "
+)
+# Advertises tools that may not exist in this session: only included when the
+# toolset is enabled for the platform.
+LINEAR_AGENT_TOOLSET_HINT = (
+    "For ALL Linear reads "
+    "and writes, always prefer the linear_agent_* toolset over the generic "
+    "mcp_linear_* tools — linear_agent_* tools authenticate as the Linear "
+    "Agent, so changes are attributed to the agent in Linear's history. "
+    "Writes: linear_agent_update_issue, linear_agent_create_comment, "
+    "linear_agent_create_issue, linear_agent_create_project, "
+    "linear_agent_update_project, linear_agent_create_project_update, and "
+    "linear_agent_save_* tools for documents, initiatives, releases, "
+    "milestones, status updates, and customer needs. Reads: "
+    "linear_agent_list_* / linear_agent_get_* tools for teams, issues, "
+    "projects, cycles, users, labels, comments, attachments, customers, "
+    "initiatives, and releases. Write tools are gated by the operator's "
+    "mutation_policy and may be disabled; if a write is rejected, report "
+    "the policy message rather than retrying. "
+)
+PLATFORM_HINT_BASE_AFTER = (
+    "When changing an issue's "
+    "status you may pass the state NAME (e.g. state: 'Done') — it is "
+    "resolved to the correct stateId automatically; likewise pass "
+    "priority as a NAME (e.g. priority: 'Low') — Linear's numeric scale "
+    "is 0=None, 1=Urgent, 2=High, 3=Medium, 4=Low, so a guessed number "
+    "silently sets the wrong value. Never set yourself as an issue's "
+    "delegate or assignee unless the user explicitly asks you to. "
+    "When your work "
+    "produces an external artifact (a PR, document, or dashboard), "
+    "attach it with linear_agent_set_session_links using the Session "
+    "ID from your prompt. For multi-step work, mirror your todo plan "
+    "into linear_agent_update_plan (send the FULL step list every time, "
+    "updating each step's status as it starts and finishes) so Linear "
+    "renders live progress. Never write tool-call syntax (e.g. "
+    "<tool_code>) into your response text; always emit real tool calls."
+)
+
+LINEAR_AGENT_PLATFORM_NAME = "linear_agent"
+LINEAR_AGENT_TOOLSET_NAME = "linear_agent"
+# Mirrors hermes_cli/tools_config.py:110 (_DEFAULT_OFF_TOOLSETS): a default-off
+# plugin toolset is only enabled when the operator lists it explicitly.
+_DEFAULT_OFF_PLUGIN_TOOLSETS = frozenset(
+    {"spotify", "discord", "discord_admin", "video", "video_gen", "x_search", "a2a", "kanban"}
+)
+
+
+def build_platform_hint(include_linear_agent_tools: bool) -> str:
+    """The Linear platform hint, with the linear_agent_* paragraph optional."""
+    base = PLATFORM_HINT_BASE_BEFORE + PLATFORM_HINT_BASE_AFTER
+    if include_linear_agent_tools:
+        return PLATFORM_HINT_BASE_BEFORE + LINEAR_AGENT_TOOLSET_HINT + PLATFORM_HINT_BASE_AFTER
+    return base
+
+
+def linear_agent_toolset_enabled(config: dict | None = None) -> bool:
+    """Whether the ``linear_agent`` toolset is enabled for the Linear platform.
+
+    Mirrors ``hermes_cli/tools_config.py:526-534`` (``_enabled_plugin_toolsets``)
+    as applied by ``_get_platform_tools`` (:578): for a plugin toolset the rule is
+    "on unless default-off, or known-for-this-platform and absent from the saved
+    list". ``_get_platform_tools``/``_enabled_plugin_toolsets`` are
+    underscore-prefixed core internals (banned by AGENTS.md), so the rule is
+    inlined. When ``platform_toolsets.linear_agent`` is absent core falls back to
+    the composite ``hermes-linear_agent``, which never lists this toolset id, so
+    the plugin rule alone decides. Every failure answers False: the hint then
+    simply omits the paragraph.
+    """
+    try:
+        if config is None:
+            from hermes_cli.config import load_config
+
+            config = load_config()
+        if not isinstance(config, dict):
+            return False
+        saved = (config.get("platform_toolsets") or {}).get(LINEAR_AGENT_PLATFORM_NAME)
+        if isinstance(saved, list) and LINEAR_AGENT_TOOLSET_NAME in {str(name) for name in saved}:
+            return True
+        known = (config.get("known_plugin_toolsets") or {}).get(LINEAR_AGENT_PLATFORM_NAME) or []
+        known_names = {str(name) for name in known} if isinstance(known, (list, tuple, set)) else set()
+        if LINEAR_AGENT_TOOLSET_NAME in known_names:
+            return False
+        return LINEAR_AGENT_TOOLSET_NAME not in _DEFAULT_OFF_PLUGIN_TOOLSETS
+    except Exception:  # noqa: BLE001 - the hint must never break registration
+        return False
+
+
 def register(ctx) -> None:
     """Plugin entry point called by Hermes plugin discovery."""
     # See tools.register_tools_with_context: tracks the toolset as
@@ -2258,45 +2439,5 @@ def register(ctx) -> None:
         max_message_length=MAX_MESSAGE_LENGTH,
         emoji="LA",
         pii_safe=True,
-        platform_hint=(
-            "You are responding in a Linear Agent Session. Your final response "
-            "text is delivered directly into the session's Linear thread — put "
-            "the ACTUAL content of your reply there, never a narration like "
-            "'posted X in the thread'. Do NOT use linear_agent_create_comment "
-            "to talk to the user in the CURRENT session; that duplicates the "
-            "conversation and buries your reply. Comment tools are for OTHER "
-            "issues, when the user explicitly asks for a comment, or when a "
-            "'Reply in the source thread' instruction is present in your prompt "
-            "(then follow it exactly). To ask "
-            "the user something, ask directly in your response (or via your "
-            "clarify tool) — the session waits for their reply. "
-            "For ALL Linear reads "
-            "and writes, always prefer the linear_agent_* toolset over the generic "
-            "mcp_linear_* tools — linear_agent_* tools authenticate as the Linear "
-            "Agent, so changes are attributed to the agent in Linear's history. "
-            "Writes: linear_agent_update_issue, linear_agent_create_comment, "
-            "linear_agent_create_issue, linear_agent_create_project, "
-            "linear_agent_update_project, linear_agent_create_project_update, and "
-            "linear_agent_save_* tools for documents, initiatives, releases, "
-            "milestones, status updates, and customer needs. Reads: "
-            "linear_agent_list_* / linear_agent_get_* tools for teams, issues, "
-            "projects, cycles, users, labels, comments, attachments, customers, "
-            "initiatives, and releases. Write tools are gated by the operator's "
-            "mutation_policy and may be disabled; if a write is rejected, report "
-            "the policy message rather than retrying. When changing an issue's "
-            "status you may pass the state NAME (e.g. state: 'Done') — it is "
-            "resolved to the correct stateId automatically; likewise pass "
-            "priority as a NAME (e.g. priority: 'Low') — Linear's numeric scale "
-            "is 0=None, 1=Urgent, 2=High, 3=Medium, 4=Low, so a guessed number "
-            "silently sets the wrong value. Never set yourself as an issue's "
-            "delegate or assignee unless the user explicitly asks you to. "
-            "When your work "
-            "produces an external artifact (a PR, document, or dashboard), "
-            "attach it with linear_agent_set_session_links using the Session "
-            "ID from your prompt. For multi-step work, mirror your todo plan "
-            "into linear_agent_update_plan (send the FULL step list every time, "
-            "updating each step's status as it starts and finishes) so Linear "
-            "renders live progress. Never write tool-call syntax (e.g. "
-            "<tool_code>) into your response text; always emit real tool calls."
-        ),
+        platform_hint=build_platform_hint(linear_agent_toolset_enabled()),
     )
