@@ -1,7 +1,3 @@
-[build-system]
-requires = ["setuptools>=77", "wheel"]
-build-backend = "setuptools.build_meta"
-
 [project]
 name = "hermes-linear-agent"
 version = "0.4.2"
@@ -27,12 +23,6 @@ Homepage = "https://github.com/infinityrobot/hermes-linear-agent"
 Repository = "https://github.com/infinityrobot/hermes-linear-agent"
 Issues = "https://github.com/infinityrobot/hermes-linear-agent/issues"
 
-[project.entry-points."hermes_agent.plugins"]
-linear-agent = "hermes_linear_agent"
-
-[project.scripts]
-hermes-linear-agent-oauth = "hermes_linear_agent.oauth:main"
-
 [project.optional-dependencies]
 dev = [
   "build>=1.2",
@@ -41,10 +31,8 @@ dev = [
   "ruff>=0.9",
 ]
 
-[tool.setuptools.packages.find]
-include = ["hermes_linear_agent*"]
-
 [tool.pytest.ini_options]
+pythonpath = ["."]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 addopts = "-ra"

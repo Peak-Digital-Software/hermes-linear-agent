@@ -185,6 +185,8 @@ For local development, expose the configured port with a tunnel and use the tunn
 
 ## Peak fork changes
 
+- Metadata-only package (no `[build-system]`): Hermes keys each profile's copy separately, so one multiplexed gateway can run the plugin on several profiles. Git install only; the `hermes-linear-agent-oauth` script is gone, use `hermes gateway setup`.
+
 Hardening applied on top of upstream `626b037` (see the `tests/test_peak_*.py` suites):
 
 - **P1 — replay freshness:** a *signed* delivery with no timestamp anywhere (no timestamp header, no signed `webhookTimestamp`) is rejected instead of staying replayable forever.

@@ -51,6 +51,12 @@ def test_tools_register_only_through_plugin_context():
     assert "ctx.register_tool(" in tools_source
 
 
-def test_pip_entry_point_targets_package_module():
-    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    assert 'linear-agent = "hermes_linear_agent"' in pyproject
+def test_package_is_metadata_only_so_profiles_do_not_collide():
+    """Hermes renames only build-less workspace members per profile; a buildable
+    package installed on two profiles of one gateway fails `uv lock`."""
+    import tomllib
+
+    doc = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    assert "build-system" not in doc
+    assert doc.get("tool", {}).get("uv", {}).get("package") is not True
+    assert "entry-points" not in doc["project"]
