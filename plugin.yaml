@@ -26,6 +26,10 @@ optional_env:
     description: "Shared secret for verifying Linear webhook signatures. Unsigned webhooks are rejected unless allow_unsigned_webhooks is explicitly enabled."
     prompt: "Linear webhook signing secret"
     password: true
+  - name: LINEAR_AGENT_WAKE_SECRET
+    description: "HMAC secret for the loopback POST /internal/wake endpoint. Unset disables the endpoint (503)."
+    prompt: "Wake endpoint HMAC secret (or empty to disable)"
+    password: true
   - name: LINEAR_AGENT_HOME_TARGET
     description: "Issue ID or identifier (e.g. ENG-123) that receives cron/notification deliveries as comments."
     prompt: "Home issue for cron delivery (or empty)"
