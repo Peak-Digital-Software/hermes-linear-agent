@@ -453,13 +453,26 @@ def extract_context(
         issue_identifier=_string(issue.get("identifier")),
         issue_title=_string(issue.get("title")),
         comment_id=_string(comment.get("id")),
+        # Linear's AgentSessionEventWebhookPayload names the sender
+        # agentActivity.user/userId (prompted) and agentSession.creator/
+        # creatorId (created); actor/user are older shapes kept as fallbacks.
         actor_user_id=_string(
             actor.get("id")
             or activity_actor.get("id")
+            or agent_activity.get("userId")
+            or _get_path(agent_activity, "user", "id")
+            or session.get("creatorId")
+            or _get_path(session, "creator", "id")
             or payload.get("actorUserId")
             or _get_path(payload, "user", "id")
         ),
-        actor_user_name=_string(actor.get("name") or activity_actor.get("name") or _get_path(payload, "user", "name")),
+        actor_user_name=_string(
+            actor.get("name")
+            or activity_actor.get("name")
+            or _get_path(agent_activity, "user", "name")
+            or _get_path(session, "creator", "name")
+            or _get_path(payload, "user", "name")
+        ),
         team_id=_string(team.get("id") or payload.get("teamId")),
         prompt_context=_string(payload.get("promptContext") or session.get("promptContext")),
         guidance=_guidance_text(payload.get("guidance") or session.get("guidance")),

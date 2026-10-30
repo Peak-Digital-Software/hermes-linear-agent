@@ -32,3 +32,13 @@ class _PlatformRegistrationContext:
 @pytest.fixture(scope="session", autouse=True)
 def _register_standalone_platform():
     register(_PlatformRegistrationContext())
+
+
+@pytest.fixture(autouse=True)
+def _isolate_linear_env(monkeypatch):
+    """Tests must not see the operator's real LINEAR_* credentials."""
+    import os
+
+    for name in list(os.environ):
+        if name.startswith("LINEAR_"):
+            monkeypatch.delenv(name, raising=False)

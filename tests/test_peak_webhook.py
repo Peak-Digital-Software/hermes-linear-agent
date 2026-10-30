@@ -205,3 +205,41 @@ async def test_boolean_true_policy_still_enables_writes():
     await client.update_issue("issue-1", {"title": "x"}, mutation_policy={"update_issues": True})
 
     assert client.executed is True
+
+
+def test_sender_is_read_from_linear_agent_session_event_shape():
+    """P10: AgentSessionEventWebhookPayload names the sender agentActivity.userId
+    (prompted) and agentSession.creatorId (created); no top-level actor."""
+    from hermes_linear_agent.webhook import extract_context
+
+    issue = {"id": "issue-1", "identifier": "ENG-1", "team": {"id": "team-1"}}
+    prompted = {
+        "type": "AgentSessionEvent",
+        "action": "prompted",
+        "organizationId": "org-1",
+        "agentSession": {"id": "sess-1", "issue": issue, "creatorId": "creator-1"},
+        "agentActivity": {
+            "id": "act-1",
+            "userId": "tom-1",
+            "user": {"id": "tom-1", "name": "Tom"},
+            "content": {"type": "prompt", "body": "hello"},
+        },
+    }
+    ctx = extract_context(prompted, {})
+    assert ctx.actor_user_id == "tom-1"
+    assert ctx.actor_user_name == "Tom"
+
+    created = {
+        "type": "AgentSessionEvent",
+        "action": "created",
+        "organizationId": "org-1",
+        "agentSession": {
+            "id": "sess-2",
+            "issue": issue,
+            "creatorId": "tom-1",
+            "creator": {"id": "tom-1", "name": "Tom"},
+            "comment": {"id": "c-1", "body": "@gilfoyle hi"},
+        },
+    }
+    ctx = extract_context(created, {})
+    assert ctx.actor_user_id == "tom-1"
