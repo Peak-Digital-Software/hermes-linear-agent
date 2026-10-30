@@ -30,6 +30,21 @@ from hermes_linear_agent.webhook import extract_context
 class _FakeLinearClient:
     def __init__(self):
         self.calls = []
+        # issue id -> agent session nodes (P12 handoff count / P13 recovery)
+        self.agent_sessions = {}
+        # agent session id -> comment author id (P12 sender fallback)
+        self.comment_users = {}
+        self.agent_sessions_error = None
+
+    async def list_issue_agent_sessions(self, issue_id, limit=50):
+        if self.agent_sessions_error:
+            raise self.agent_sessions_error
+        return list(self.agent_sessions.get(issue_id, []))
+
+    async def get_agent_session_comment_user_id(self, agent_session_id):
+        if self.agent_sessions_error:
+            raise self.agent_sessions_error
+        return self.comment_users.get(agent_session_id, "")
 
     async def create_thought(self, agent_session_id, body, *, ephemeral=False):
         self.calls.append(("thought", agent_session_id, body))
@@ -471,3 +486,299 @@ def test_str_env_reads_the_profile_secret_scope(monkeypatch):
     )
     assert adapter_mod._str_env("LINEAR_AGENT_CLIENT_ID") == "scoped-id"
     assert adapter_mod._str_env("LINEAR_AGENT_MISSING") == ""
+
+
+# ---------------------------------------------------------------------------
+# P12 — peer agent handoffs with a Linear-derived loop cap
+# ---------------------------------------------------------------------------
+
+
+def _handoff_created_payload(
+    event_id="evt-peer",
+    *,
+    session_id="session-peer",
+    issue_id="issue-1",
+    comment_user_id="peer-1",
+    include_comment=True,
+):
+    """A `created` session another agent app opened (creator is null)."""
+    payload = {
+        "action": "created",
+        "id": event_id,
+        "promptContext": "Handoff from the triage agent.",
+        "agentSession": {
+            "id": session_id,
+            "workspaceId": "workspace-1",
+            "status": "pending",
+            "commentId": "comment-1",
+            "issue": {
+                "id": issue_id,
+                "identifier": "LIN-123",
+                "title": "Fix the flaky job",
+                "team": {"id": "team-1"},
+            },
+        },
+    }
+    if include_comment:
+        payload["agentSession"]["comment"] = {
+            "id": "comment-1",
+            "body": "<<mention>>",
+            "userId": comment_user_id,
+        }
+    return payload
+
+
+def _app_session(session_id, *, created_at, app_user_id="peer-1"):
+    """An app-initiated agent session: no human creator, app comment author."""
+    return {
+        "id": session_id,
+        "createdAt": created_at,
+        "creator": None,
+        "appUser": {"id": app_user_id, "name": "Agent"},
+        "comment": {"id": f"c-{session_id}", "user": {"id": app_user_id, "name": "Agent", "app": True}},
+    }
+
+
+def _human_session(session_id, *, created_at, user_id="user-1"):
+    return {
+        "id": session_id,
+        "createdAt": created_at,
+        "creator": {"id": user_id, "name": "Ada", "app": False},
+        "appUser": {"id": "app-1", "name": "Hermes"},
+        "comment": {"id": f"c-{session_id}", "user": {"id": user_id, "name": "Ada", "app": False}},
+    }
+
+
+async def _capture_events(adapter):
+    events = []
+
+    async def capture(event):
+        events.append(event)
+
+    adapter._message_handler = capture
+    return events
+
+
+@pytest.mark.asyncio
+async def test_creatorless_session_takes_its_sender_from_the_comment_user():
+    """A peer session has no agentActivity.userId and no creator: the sender
+    is the session comment's author (payload field agentSession.comment.userId)."""
+    client = _FakeLinearClient()
+    adapter = _make_adapter(
+        client=client,
+        extra={"app_user_id": "app-1", "allow_all_users": False, "allowed_users": ["peer-1"]},
+    )
+    events = await _capture_events(adapter)
+
+    context = extract_context(_handoff_created_payload(), {})
+    assert context.actor_user_id == ""
+    assert context.comment_user_id == "peer-1"
+
+    _, status = await _post(adapter, _handoff_created_payload(), delivery_id="evt-peer")
+    await _settle()
+
+    assert status == 200
+    assert len(events) == 1
+    assert events[0].source.user_id == "peer-1"
+
+
+@pytest.mark.asyncio
+async def test_sender_falls_back_to_a_graphql_comment_lookup_when_the_payload_omits_it():
+    client = _FakeLinearClient()
+    client.comment_users["session-peer"] = "peer-1"
+    adapter = _make_adapter(
+        client=client,
+        extra={"app_user_id": "app-1", "allow_all_users": False, "allowed_users": ["peer-1"]},
+    )
+    events = await _capture_events(adapter)
+
+    payload = _handoff_created_payload(include_comment=False)
+    _, status = await _post(adapter, payload, delivery_id="evt-peer")
+    await _settle()
+
+    assert status == 200
+    assert [event.source.user_id for event in events] == ["peer-1"]
+
+
+@pytest.mark.asyncio
+async def test_peer_is_allowed_and_non_peer_and_self_are_refused():
+    peer = _make_adapter(
+        extra={
+            "app_user_id": "app-1",
+            "allow_all_users": False,
+            "peer_app_user_ids": ["peer-1"],
+        }
+    )
+    events = await _capture_events(peer)
+    _, status = await _post(peer, _handoff_created_payload(), delivery_id="evt-peer")
+    await _settle()
+    assert status == 200
+    assert len(events) == 1
+
+    stranger = _make_adapter(
+        extra={"app_user_id": "app-1", "allow_all_users": False, "peer_app_user_ids": ["peer-1"]}
+    )
+    stranger_events = await _capture_events(stranger)
+    _, status = await _post(
+        stranger,
+        _handoff_created_payload(comment_user_id="someone-else"),
+        delivery_id="evt-stranger",
+    )
+    await _settle()
+    assert status == 403
+    assert stranger_events == []
+
+    # Our own app user id is never a valid sender, even when it is listed and
+    # every user is allowed.
+    own = _make_adapter(
+        extra={
+            "app_user_id": "app-1",
+            "allow_all_users": True,
+            "peer_app_user_ids": ["app-1"],
+        }
+    )
+    own_events = await _capture_events(own)
+    _, status = await _post(own, _handoff_created_payload(comment_user_id="app-1"), delivery_id="evt-self")
+    await _settle()
+    assert status == 403
+    assert own_events == []
+
+
+@pytest.mark.asyncio
+async def test_handoff_cap_allows_two_and_refuses_three():
+    client = _FakeLinearClient()
+    client.agent_sessions["issue-1"] = [
+        _human_session("session-human", created_at="2026-01-01T00:00:00.000Z"),
+        _app_session("session-a", created_at="2026-01-01T00:01:00.000Z"),
+        _app_session("session-b", created_at="2026-01-01T00:02:00.000Z"),
+    ]
+    adapter = _make_adapter(client=client, extra={"app_user_id": "app-1", "peer_app_user_ids": ["peer-1"]})
+    events = await _capture_events(adapter)
+
+    _, status = await _post(adapter, _handoff_created_payload(), delivery_id="evt-peer")
+    await _settle()
+    assert status == 200
+    assert len(events) == 1, "a peer session at the cap must still be dispatched"
+
+    # A third handoff on the issue saturates it (max defaults to 2).
+    client.agent_sessions["issue-1"].append(_app_session("session-c", created_at="2026-01-01T00:03:00.000Z"))
+    client.calls.clear()
+    response, status = await _post(
+        adapter, _handoff_created_payload(session_id="session-d", event_id="evt-4"), delivery_id="evt-4"
+    )
+    await _settle()
+
+    assert response["status"] == "refused"
+    assert response["handoffs"] == 3
+    assert status == 200
+    assert len(events) == 1, "a refused handoff must not reach Hermes"
+    responses = [call for call in client.calls if call[0] == "response"]
+    assert len(responses) == 1
+    assert responses[0][1] == "session-d"
+    assert "already has 3 agent-to-agent handoffs" in responses[0][2]
+    assert "Tom needs to step in" in responses[0][2]
+    # No acknowledgement thought either: the refusal is the only activity.
+    assert [call[0] for call in client.calls] == ["response"]
+
+
+@pytest.mark.asyncio
+async def test_handoff_cap_counts_creator_app_sessions_too():
+    client = _FakeLinearClient()
+    client.agent_sessions["issue-1"] = [
+        {
+            "id": f"session-{i}",
+            "createdAt": f"2026-01-01T00:0{i}:00.000Z",
+            "creator": {"id": "peer-1", "name": "Agent", "app": True},
+            "appUser": {"id": "peer-1"},
+            "comment": None,
+        }
+        for i in range(3)
+    ]
+    adapter = _make_adapter(client=client, extra={"app_user_id": "app-1", "peer_app_user_ids": ["peer-1"]})
+
+    response, status = await _post(adapter, _handoff_created_payload(), delivery_id="evt-peer")
+    assert status == 200 and response["status"] == "refused"
+
+
+@pytest.mark.asyncio
+async def test_handoff_cap_fails_closed_when_the_count_query_errors():
+    client = _FakeLinearClient()
+    client.agent_sessions_error = RuntimeError("linear is down")
+    adapter = _make_adapter(client=client, extra={"app_user_id": "app-1", "peer_app_user_ids": ["peer-1"]})
+    events = await _capture_events(adapter)
+
+    response, status = await _post(adapter, _handoff_created_payload(), delivery_id="evt-peer")
+    await _settle()
+
+    assert status == 200
+    assert response["status"] == "refused"
+    assert events == []
+    assert [call[0] for call in client.calls] == ["error"]
+    assert client.calls[0][1] == "session-peer"
+
+
+@pytest.mark.asyncio
+async def test_human_sessions_never_hit_the_handoff_cap():
+    """Only peer senders are capped; a human mention dispatches regardless."""
+    client = _FakeLinearClient()
+    client.agent_sessions["issue-1"] = [_app_session(f"session-{i}", created_at=f"2026-01-01T00:0{i}:00.000Z") for i in range(5)]
+    adapter = _make_adapter(client=client, extra={"app_user_id": "app-1"})
+    events = await _capture_events(adapter)
+
+    _, status = await _post(adapter, _prompted_payload(), delivery_id="evt-human")
+    await _settle()
+
+    assert status == 200
+    assert len(events) == 1
+    assert client.calls == []
+
+
+# ---------------------------------------------------------------------------
+# P13 — recover the reply session from Linear after a restart
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_send_recovers_the_newest_own_agent_session_after_a_restart():
+    client = _FakeLinearClient()
+    client.agent_sessions["issue-1"] = [
+        {"id": "session-own-old", "createdAt": "2026-01-01T00:00:00.000Z", "appUser": {"id": "app-1"}},
+        {"id": "session-other", "createdAt": "2026-01-01T00:05:00.000Z", "appUser": {"id": "app-other"}},
+        {"id": "session-own-new", "createdAt": "2026-01-01T00:02:00.000Z", "appUser": {"id": "app-1"}},
+    ]
+    adapter = _make_adapter(client=client, extra={"app_user_id": "app-1"})
+    assert adapter._latest_agent_session == {}
+
+    result = await adapter.send("issue-1", "Here is the result.")
+
+    assert result.success is True
+    assert [call[0] for call in client.calls] == ["response"]
+    assert client.calls[0][1] == "session-own-new"
+    assert adapter._latest_agent_session["issue-1"] == "session-own-new"
+
+
+@pytest.mark.asyncio
+async def test_send_falls_back_to_a_comment_when_the_recovery_lookup_fails():
+    client = _FakeLinearClient()
+    client.agent_sessions_error = RuntimeError("linear is down")
+    adapter = _make_adapter(client=client, extra={"app_user_id": "app-1", "mutation_policy": {"create_comments": True}})
+
+    result = await adapter.send("issue-1", "Here is the result.")
+
+    assert result.success is True
+    assert [call[0] for call in client.calls] == ["comment"]
+    assert client.calls[0][1] == "issue-1"
+
+
+@pytest.mark.asyncio
+async def test_send_does_not_recover_for_a_synthetic_issue_update_target():
+    client = _FakeLinearClient()
+    client.agent_sessions["issue-1"] = [
+        {"id": "session-own", "createdAt": "2026-01-01T00:00:00.000Z", "appUser": {"id": "app-1"}},
+    ]
+    adapter = _make_adapter(client=client, extra={"app_user_id": "app-1", "mutation_policy": {"create_comments": True}})
+
+    result = await adapter.send("update:issue-1", "Here is the result.")
+
+    assert result.success is True
+    assert [call[0] for call in client.calls] == ["comment"]

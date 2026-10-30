@@ -30,6 +30,11 @@ class LinearWebhookContext:
     issue_identifier: str = ""
     issue_title: str = ""
     comment_id: str = ""
+    # Author of the session's own comment, when the payload serializes it.
+    # Linear sets AgentSession.creator = null for sessions another agent app
+    # created, but the session's comment still names the originating app user,
+    # which is the only sender evidence in that payload (see P12).
+    comment_user_id: str = ""
     actor_user_id: str = ""
     actor_user_name: str = ""
     team_id: str = ""
@@ -453,6 +458,14 @@ def extract_context(
         issue_identifier=_string(issue.get("identifier")),
         issue_title=_string(issue.get("title")),
         comment_id=_string(comment.get("id")),
+        # CommentChildWebhookPayload flattens the author to ``userId``; the
+        # nested ``user`` shape is kept as a fallback against payload drift.
+        comment_user_id=_string(
+            _get_path(comment, "userId")
+            or _get_path(comment, "user", "id")
+            or _get_path(session, "comment", "userId")
+            or _get_path(payload, "comment", "userId")
+        ),
         # Linear's AgentSessionEventWebhookPayload names the sender
         # agentActivity.user/userId (prompted) and agentSession.creator/
         # creatorId (created); actor/user are older shapes kept as fallbacks.
@@ -491,6 +504,7 @@ def is_authorized(
     context: LinearWebhookContext,
     *,
     allowed_users: list[str] | tuple[str, ...] | set[str] | None = None,
+    peer_app_user_ids: list[str] | tuple[str, ...] | set[str] | None = None,
     allowed_teams: list[str] | tuple[str, ...] | set[str] | None = None,
     allow_all_users: bool = False,
 ) -> bool:
@@ -503,11 +517,19 @@ def is_authorized(
     check runs FIRST, and pre-dispatch side effects (created-ack thought,
     auto-start, the stop-signal interrupt + confirmation) must never fire
     for a sender the gateway would reject.
+
+    ``peer_app_user_ids`` grants a SECOND, narrower class of sender: other
+    agent apps that hand work to this one. It is an explicit list rather
+    than a re-use of the human allowlists so an operator can permit machine
+    handoffs without opening the session to arbitrary members; team
+    narrowing still applies to peers.
     """
     users = {str(item).strip() for item in (allowed_users or []) if str(item).strip()}
+    peers = {str(item).strip() for item in (peer_app_user_ids or []) if str(item).strip()}
     teams = {str(item).strip() for item in (allowed_teams or []) if str(item).strip()}
 
-    if not allow_all_users and context.actor_user_id not in users:
+    sender = context.actor_user_id
+    if sender not in peers and not allow_all_users and sender not in users:
         return False
     if teams and context.team_id not in teams:
         return False

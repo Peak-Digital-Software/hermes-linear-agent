@@ -1090,6 +1090,50 @@ mutation AgentSessionUpdate($id: String!, $input: AgentSessionUpdateInput!) {
         data = await self.execute(q, {"issueId": issue_id, "first": limit})
         return data.get("issue", {}).get("comments", {}).get("nodes", [])
 
+    async def list_issue_agent_sessions(self, issue_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        """Agent sessions on an issue, with the fields that identify a handoff.
+
+        ``creator`` is null for sessions an agent app created (Linear sets no
+        human creator for machine handoffs), so the initiating app has to be
+        read from ``creator.app`` or, when there is no creator at all, from
+        the session comment's author (``comment.user.app``). ``appUser`` names
+        the app the session itself belongs to — the reply-recovery identity.
+        """
+        q = """
+        query IssueAgentSessions($id: String!, $first: Int) {
+          issue(id: $id) {
+            agentSessions(first: $first) {
+              nodes {
+                id createdAt status
+                creator { id name app }
+                appUser { id name }
+                comment { id user { id name app } }
+              }
+            }
+          }
+        }
+        """
+        data = await self.execute(q, {"id": issue_id, "first": limit})
+        return ((data.get("issue") or {}).get("agentSessions") or {}).get("nodes", [])
+
+    async def get_agent_session_comment_user_id(self, agent_session_id: str) -> str:
+        """Author id of an agent session's comment ("" when unavailable).
+
+        The comment-mention webhook payload does not always serialize the
+        comment author; this is the fallback source of the originating app
+        user id for an agent-to-agent handoff.
+        """
+        q = """
+        query AgentSessionCommentUser($id: String!) {
+          agentSession(id: $id) {
+            comment { id user { id } }
+          }
+        }
+        """
+        data = await self.execute(q, {"id": agent_session_id})
+        session = data.get("agentSession") or {}
+        return str(((session.get("comment") or {}).get("user") or {}).get("id") or "").strip()
+
     async def get_comment_thread_root_id(self, comment_id: str) -> str | None:
         """Return the root comment ID for a root or child comment.
 

@@ -91,6 +91,8 @@ LINEAR_AGENT_APP_USER_ID=
 LINEAR_AGENT_WORKSPACE_ID=
 LINEAR_AGENT_HOME_TARGET=
 LINEAR_AGENT_ALLOWED_USERS=
+LINEAR_AGENT_PEER_APP_USER_IDS=
+LINEAR_AGENT_MAX_AGENT_HANDOFFS=2
 LINEAR_AGENT_ALLOW_ALL_USERS=
 LINEAR_AGENT_AUTH_PATH=
 ```
@@ -117,6 +119,17 @@ linear_agent:
   app_user_id: ""
   allowed_teams: []
   allowed_users: []
+  # Other Linear agent APPS allowed to hand work to this one. Agent-to-agent
+  # sessions arrive with no human creator, so they are authorized by their
+  # session comment's author (an app user) instead of `allowed_users`. This
+  # agent's own app_user_id is never a valid sender. Peers still must pass
+  # `allowed_teams` when it is set.
+  peer_app_user_ids: []
+  # Agent-to-agent loop cap: a peer session is dispatched only while the issue
+  # has at most this many app-initiated agent sessions (counted from Linear, so
+  # a restart cannot reset it). Beyond it the session gets one refusal activity
+  # asking a human to take over: "Tom needs to step in."
+  max_agent_handoffs: 2
   allow_all_users: false
   ack_on_created: true
   # Move an issue delegated to the agent to its first "started" state
@@ -197,10 +210,12 @@ Hardening applied on top of upstream `626b037` (see the `tests/test_peak_*.py` s
 - **P6 — workspace fail-closed:** a webhook that cannot name the configured workspace is treated as foreign and ignored.
 - **P7 — `/p/<profile>/` validation:** a path naming a profile this listener does not serve is a 404, before the body is authenticated or any side effect runs.
 - **P8 — loopback bind:** the webhook listener defaults to `127.0.0.1`, not every interface.
+- **P12 — peer agent handoffs with a loop cap:** a session another agent app created has no `agentActivity.userId` and no `agentSession.creatorId` (Linear leaves the creator null for machine handoffs), so the sender now falls back to the session comment's author — `agentSession.comment.userId` in the payload, else a GraphQL `agentSession(id){ comment{ user{ id } } }` lookup. A sender in `peer_app_user_ids` is allowed alongside `allowed_users`; this adapter's own `app_user_id` is never a valid sender. A peer `created` session is dispatched only while the issue has at most `max_agent_handoffs` (default 2) app-initiated sessions, counted from Linear (`issue(id){ agentSessions { nodes { creator{app} comment{user{app}} } } }`) so a restart cannot reset the cap; past it the session gets one refusal activity ("Tom needs to step in") and no turn runs. An unreadable count refuses the peer session with an error activity (fail closed). Human sessions never hit this path.
+- **P13 — reply session recovered after a restart:** with the in-memory issue → session map empty, `send()` asks Linear for the issue's newest agent session whose `appUser` is this app and replies there (caching it) instead of dropping to an issue comment; other apps' sessions are ignored, and a failed/empty lookup keeps the comment fallback.
 
 ## Notes
 
-- One Hermes conversation per Linear **issue**, not per Linear agent session: a follow-up mention on the same issue continues the same session (so it remembers the work and can interrupt it), and each reply is posted into the NEWEST agent session on that issue. If the gateway restarted and no session is known yet, the reply posts as an issue comment.
+- One Hermes conversation per Linear **issue**, not per Linear agent session: a follow-up mention on the same issue continues the same session (so it remembers the work and can interrupt it), and each reply is posted into the NEWEST agent session on that issue. If the gateway restarted and no session is known yet, the reply is recovered from Linear (this app's newest session on the issue, P13) and only posts as an issue comment when that lookup finds nothing.
 - Normal Hermes final responses are sent as Linear `response` activities. For comment-mention sessions Linear mirrors the response into the session's thread; mentioning the agent inside an existing thread makes Linear re-anchor the conversation at a new root comment, so the reply appears there rather than in the original thread.
 - New sessions optionally receive a quick `thought` acknowledgement.
 - Dispatch failures are reported as Linear `error` activities.

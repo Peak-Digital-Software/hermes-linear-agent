@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -73,6 +74,10 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8651
 DEFAULT_WEBHOOK_PATH = "/hermes/linear-agent"
 DEFAULT_ACK_BODY = "I’m starting work on this."
+# Agent-to-agent handoff cap. A peer session is accepted only while the issue
+# still has at most this many app-initiated sessions; beyond it a human has to
+# take over (two agents can otherwise ping an issue back and forth forever).
+DEFAULT_MAX_AGENT_HANDOFFS = 2
 # All write operations fail closed: each key must be explicitly enabled.
 # `update_projects` also covers project updates (status updates), milestones,
 # and initiatives — project-structure mutations share one umbrella key.
@@ -136,6 +141,13 @@ def _bool_opt(extra: dict[str, Any], key: str, env_name: str, default: bool) -> 
 def _floatish(value: Any, default: float = 0.0) -> float:
     try:
         return float(value or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _intish(value: Any, default: int) -> int:
+    try:
+        return int(value)
     except (TypeError, ValueError):
         return default
 
@@ -369,6 +381,8 @@ def _env_enablement() -> dict[str, Any] | None:
         ("LINEAR_AGENT_OAUTH_SCOPES", "oauth_scopes"),
         ("LINEAR_AGENT_HOME_TARGET", "home_target"),
         ("LINEAR_AGENT_ALLOWED_USERS", "allowed_users"),
+        ("LINEAR_AGENT_PEER_APP_USER_IDS", "peer_app_user_ids"),
+        ("LINEAR_AGENT_MAX_AGENT_HANDOFFS", "max_agent_handoffs"),
         ("LINEAR_AGENT_ALLOWED_TEAMS", "allowed_teams"),
         ("LINEAR_AGENT_ALLOW_ALL_USERS", "allow_all_users"),
     ):
@@ -393,6 +407,8 @@ def _apply_yaml_config(yaml_cfg: dict, platform_cfg: dict) -> dict[str, Any] | N
         "client_secret",
         "allowed_teams",
         "allowed_users",
+        "peer_app_user_ids",
+        "max_agent_handoffs",
         "allow_all_users",
         "ack_on_created",
         "ack_body",
@@ -504,6 +520,17 @@ class LinearAgentAdapter(BasePlatformAdapter):
         # layer reads the same env vars independently.
         self._allowed_teams = _list_value(extra.get("allowed_teams") or _str_env("LINEAR_AGENT_ALLOWED_TEAMS"))
         self._allowed_users = _list_value(extra.get("allowed_users") or _str_env("LINEAR_AGENT_ALLOWED_USERS"))
+        # Other agent apps allowed to hand work to this one. A peer session
+        # arrives with no human creator (Linear sets AgentSession.creator =
+        # null), so without this list every machine handoff would look like an
+        # unauthorized sender. Never includes our own app user id.
+        self._peer_app_user_ids = _list_value(
+            extra.get("peer_app_user_ids") or _str_env("LINEAR_AGENT_PEER_APP_USER_IDS")
+        )
+        self._max_agent_handoffs = _intish(
+            extra.get("max_agent_handoffs") or _str_env("LINEAR_AGENT_MAX_AGENT_HANDOFFS"),
+            DEFAULT_MAX_AGENT_HANDOFFS,
+        )
         self._allow_all_users = _bool_opt(extra, "allow_all_users", "LINEAR_AGENT_ALLOW_ALL_USERS", False)
         self._ack_on_created = _boolish(extra.get("ack_on_created"), True)
         self._ack_body = str(extra.get("ack_body") or DEFAULT_ACK_BODY)
@@ -741,6 +768,60 @@ class LinearAgentAdapter(BasePlatformAdapter):
             return chat_id, ""
         return "", chat_id
 
+    async def _recover_reply_session(self, issue_id: str) -> str:
+        """Find this app's newest Linear agent session on an issue (P13).
+
+        The per-issue map is memory-only, so a gateway restart loses it and
+        replies fall back to an issue comment. Linear still knows the
+        sessions: pick the newest one whose ``appUser`` is THIS app. Other
+        apps' sessions on the same issue are ignored — replying into another
+        agent's session would speak for the wrong agent. Failures return ""
+        so the caller keeps the existing comment fallback.
+        """
+        if not self._app_user_id:
+            return ""
+        try:
+            sessions = await self._client.list_issue_agent_sessions(issue_id, limit=50)
+        except Exception as exc:  # noqa: BLE001 - fallback is a comment, not a failure
+            logger.warning(
+                "[linear_agent] Could not recover a reply session for issue %s: %s",
+                issue_id,
+                exc,
+            )
+            return ""
+        mine = [
+            node
+            for node in sessions or []
+            if str(((node.get("appUser") or {}).get("id")) or "").strip() == self._app_user_id
+            and str(node.get("id") or "").strip()
+        ]
+        if not mine:
+            return ""
+        # Linear's createdAt is an ISO-8601 UTC instant, so lexical order is
+        # chronological order.
+        newest = max(mine, key=lambda node: str(node.get("createdAt") or ""))
+        agent_session_id = str(newest.get("id") or "").strip()
+        if len(self._latest_agent_session) >= 512 and issue_id not in self._latest_agent_session:
+            self._latest_agent_session.clear()
+        self._latest_agent_session[issue_id] = agent_session_id
+        logger.info(
+            "[linear_agent] Recovered agent session %s for issue %s from Linear (restart)",
+            agent_session_id,
+            issue_id,
+        )
+        return agent_session_id
+
+    def _recoverable_reply_target(self, chat_id: str, metadata: dict[str, Any] | None = None) -> bool:
+        """Whether a missing reply session may be recovered from Linear.
+
+        Excluded: an explicit caller-supplied session (the caller decided the
+        target), and the synthetic ``update:<issue_id>`` issue-update session,
+        which by design has no Linear agent session to reply into.
+        """
+        if str((metadata or {}).get("linear_agent_session_id") or "").strip():
+            return False
+        return not self._issue_reply_target(str(chat_id or "").strip())
+
     async def _send_issue_comment(self, issue_id: str, content: str) -> SendResult:
         try:
             comment = await self._client.create_comment(
@@ -773,10 +854,15 @@ class LinearAgentAdapter(BasePlatformAdapter):
         ``chat_id`` is the ISSUE id (the Hermes session is keyed per issue, see
         ``_build_source``). The reply becomes a ``response`` Agent Activity in
         the newest Linear agent session seen on that issue; without a known
-        session (restart, cron/home delivery, synthetic issue-update turns) it
-        posts as a comment on the issue instead.
+        session (a remaining restart, cron/home delivery, synthetic
+        issue-update turns) it re-derives this app's newest session on the
+        issue from Linear, and only then posts as an issue comment.
         """
         agent_session_id, issue_id = self._reply_target(chat_id, metadata)
+        if not agent_session_id and issue_id and self._recoverable_reply_target(chat_id, metadata):
+            recovered = await self._recover_reply_session(issue_id)
+            if recovered:
+                agent_session_id, issue_id = recovered, ""
         if not agent_session_id:
             if not issue_id:
                 return SendResult(success=False, error="Missing Linear Agent Session ID")
@@ -1108,6 +1194,11 @@ class LinearAgentAdapter(BasePlatformAdapter):
             if not context.issue_id:
                 return {"status": "ignored", "reason": "update without issue id"}, 200
 
+        # Sender fallback for agent-to-agent handoffs: such sessions name no
+        # creator and no activity author, so resolve the session comment's
+        # author BEFORE authorization (fail closed if it cannot be resolved).
+        context = await self._resolve_sender(context)
+
         if not self._webhook_sender_authorized(context):
             logger.warning(
                 "[linear_agent] Rejected webhook for unauthorized user/team user=%s team=%s",
@@ -1121,6 +1212,15 @@ class LinearAgentAdapter(BasePlatformAdapter):
                 "status": "duplicate",
                 "delivery_id": context.delivery_id,
             }, 200
+
+        # Peer handoff cap: a `created` session from another agent app is only
+        # dispatched while the issue still has few app-initiated sessions.
+        # Humans never hit this path, and the count is read from Linear so a
+        # restart cannot reset it.
+        if context.action == "created" and self._is_peer_sender(context):
+            refusal = await self._enforce_handoff_cap(context)
+            if refusal is not None:
+                return {**refusal, "delivery_id": context.delivery_id}, 200
 
         # Record the newest agent session on this issue BEFORE any reply path
         # can run (dispatch, stop confirmation, ack): the Hermes session and
@@ -1234,6 +1334,119 @@ class LinearAgentAdapter(BasePlatformAdapter):
             self._source_thread_routes.clear()
         self._source_thread_routes[context.agent_session_id] = (context.issue_id, root_id)
 
+    async def _resolve_sender(self, context: LinearWebhookContext) -> LinearWebhookContext:
+        """Fill a missing sender from the session's comment (P12).
+
+        A session another agent app created carries no ``agentActivity.userId``
+        and no ``agentSession.creatorId`` — Linear leaves the creator null for
+        machine handoffs — so the sender would otherwise resolve to nothing
+        (and an earlier version resolved it to the receiving app itself). The
+        session's comment author is the originating app user. The webhook
+        payload normally serializes it as ``agentSession.comment.userId``;
+        when it does not, fetch it from Linear. A failed fetch leaves the
+        sender empty, which the fail-closed authorization then rejects.
+        """
+        if context.actor_user_id:
+            return context
+        if context.action not in ("created", "prompted") or self._issue_reply_target(context.agent_session_id):
+            return context
+        comment_user_id = context.comment_user_id
+        if not comment_user_id:
+            try:
+                comment_user_id = await self._client.get_agent_session_comment_user_id(context.agent_session_id)
+            except Exception as exc:  # noqa: BLE001 - unresolved sender must stay unauthorized
+                logger.warning(
+                    "[linear_agent] Could not resolve the comment author for session %s: %s",
+                    context.agent_session_id,
+                    exc,
+                )
+                return context
+        comment_user_id = str(comment_user_id or "").strip()
+        if not comment_user_id:
+            return context
+        logger.info(
+            "[linear_agent] Session %s has no creator; sender resolved to comment author %s",
+            context.agent_session_id,
+            comment_user_id,
+        )
+        return replace(context, actor_user_id=comment_user_id)
+
+    def _is_peer_sender(self, context: LinearWebhookContext) -> bool:
+        """True when the sender is a listed peer app (and not ourselves)."""
+        sender = str(context.actor_user_id or "").strip()
+        if not sender or sender == self._app_user_id:
+            return False
+        return sender in self._peer_app_user_ids
+
+    @staticmethod
+    def _session_initiated_by_app(node: dict[str, Any]) -> bool:
+        """Whether an agent session was started by an app rather than a human.
+
+        ``creator`` is null for app-created sessions; the fallback reads the
+        session comment's author, which is the other agent app in a handoff.
+        """
+        creator = node.get("creator") or {}
+        if creator.get("app") is True:
+            return True
+        if creator:
+            return False
+        return ((node.get("comment") or {}).get("user") or {}).get("app") is True
+
+    async def _enforce_handoff_cap(self, context: LinearWebhookContext) -> dict[str, Any] | None:
+        """Refuse a peer session once the issue is saturated with handoffs.
+
+        Stateless by design: the count comes from Linear's own session history
+        for the issue, so a restarted gateway cannot lose the cap. Returns an
+        accepted-webhook body when the session was refused, else None.
+        """
+        issue_id = str(context.issue_id or "").strip()
+        if not issue_id:
+            return None
+        try:
+            sessions = await self._client.list_issue_agent_sessions(issue_id, limit=50)
+        except Exception as exc:  # noqa: BLE001 - fail CLOSED for peer sessions
+            logger.warning(
+                "[linear_agent] Refusing peer session %s: handoff count unavailable (%s)",
+                context.agent_session_id,
+                exc,
+            )
+            await self._post_session_activity(
+                context.agent_session_id,
+                "Could not verify this issue's agent-to-agent handoff count, "
+                "so this handoff was refused. Tom needs to step in.",
+                error=True,
+            )
+            return {"status": "refused", "reason": "handoff count unavailable"}
+        count = sum(1 for node in sessions if self._session_initiated_by_app(node))
+        if count <= self._max_agent_handoffs:
+            return None
+        logger.warning(
+            "[linear_agent] Handoff limit reached on issue %s: %s agent-to-agent handoffs (max %s); refusing peer session %s",
+            issue_id,
+            count,
+            self._max_agent_handoffs,
+            context.agent_session_id,
+        )
+        await self._post_session_activity(
+            context.agent_session_id,
+            f"Handoff limit reached: this issue already has {count} agent-to-agent handoffs. "
+            "Tom needs to step in.",
+        )
+        return {"status": "refused", "reason": "handoff limit reached", "handoffs": count}
+
+    async def _post_session_activity(self, agent_session_id: str, body: str, *, error: bool = False) -> None:
+        try:
+            if error:
+                await self._client.create_error(agent_session_id, body)
+            else:
+                await self._client.create_response(agent_session_id, body)
+        except Exception as exc:  # noqa: BLE001 - the refusal itself must not 500
+            logger.warning(
+                "[linear_agent] Failed to post handoff refusal into session %s: %s",
+                agent_session_id,
+                exc,
+            )
+
     def _webhook_sender_authorized(self, context: LinearWebhookContext) -> bool:
         """Authorize the sender BEFORE any webhook side effect (fail closed).
 
@@ -1247,9 +1460,20 @@ class LinearAgentAdapter(BasePlatformAdapter):
         callback is registered (standalone runs, unit tests), the local
         fail-closed check decides alone.
         """
+        sender = str(context.actor_user_id or "").strip()
+        # Our own app user is never a valid sender: a session the agent
+        # created for itself (or a handoff it addressed to itself) must not
+        # re-enter as new work, whatever the allowlists say.
+        if sender and sender == self._app_user_id:
+            logger.warning(
+                "[linear_agent] Rejecting webhook whose sender is this app itself (%s)",
+                sender,
+            )
+            return False
         if is_authorized(
             context,
             allowed_users=self._allowed_users,
+            peer_app_user_ids=self._peer_app_user_ids,
             allowed_teams=self._allowed_teams,
             allow_all_users=self._allow_all_users,
         ):
@@ -1260,6 +1484,7 @@ class LinearAgentAdapter(BasePlatformAdapter):
         return gateway_verdict is True and is_authorized(
             context,
             allowed_users=self._allowed_users,
+            peer_app_user_ids=self._peer_app_user_ids,
             allowed_teams=self._allowed_teams,
             allow_all_users=True,
         )
