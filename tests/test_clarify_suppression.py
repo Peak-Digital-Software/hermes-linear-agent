@@ -152,3 +152,18 @@ async def test_a_second_identical_replay_is_sent(clock):
     assert suppressed.success is True
     assert second.success is True
     assert len(client.response_calls) == 1
+
+
+def test_adapter_without_init_state_never_suppresses():
+    """Tests build adapters with ``object.__new__``; the state reads must not raise."""
+    bare = object.__new__(LinearAgentAdapter)
+
+    assert bare._is_clarify_text_fallback(ISSUE_ID, _fallback_text(), APPROVAL_METADATA) is False
+
+
+def test_note_creates_the_registry_on_an_uninitialised_adapter(clock):
+    bare = object.__new__(LinearAgentAdapter)
+
+    bare._note_clarify_elicitation(ISSUE_ID, QUESTION)
+
+    assert bare._clarify_elicitations[ISSUE_ID][0] == QUESTION
