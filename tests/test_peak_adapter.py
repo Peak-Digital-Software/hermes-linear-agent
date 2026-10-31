@@ -644,9 +644,7 @@ async def test_peer_is_allowed_and_non_peer_and_self_are_refused():
     assert status == 200
     assert len(events) == 1
 
-    stranger = _make_adapter(
-        extra={"app_user_id": "app-1", "allow_all_users": False, "peer_app_user_ids": ["peer-1"]}
-    )
+    stranger = _make_adapter(extra={"app_user_id": "app-1", "allow_all_users": False, "peer_app_user_ids": ["peer-1"]})
     stranger_events = await _capture_events(stranger)
     _, status = await _post(
         stranger,
@@ -658,19 +656,23 @@ async def test_peer_is_allowed_and_non_peer_and_self_are_refused():
     assert stranger_events == []
 
     # Our own app user id is never a valid sender, even when it is listed and
-    # every user is allowed.
+    # every user is allowed: the session is not dispatched, it is closed.
+    own_client = _FakeLinearClient()
     own = _make_adapter(
+        client=own_client,
         extra={
             "app_user_id": "app-1",
             "allow_all_users": True,
             "peer_app_user_ids": ["app-1"],
-        }
+        },
     )
     own_events = await _capture_events(own)
     _, status = await _post(own, _handoff_created_payload(comment_user_id="app-1"), delivery_id="evt-self")
     await _settle()
-    assert status == 403
+    assert status == 200
     assert own_events == []
+    assert [call[0] for call in own_client.calls] == ["response"]
+    assert own_client.calls[0][1] == "session-peer"
 
 
 @pytest.mark.asyncio
@@ -750,7 +752,9 @@ async def test_handoff_cap_fails_closed_when_the_count_query_errors():
 async def test_human_sessions_never_hit_the_handoff_cap():
     """Only peer senders are capped; a human mention dispatches regardless."""
     client = _FakeLinearClient()
-    client.agent_sessions["issue-1"] = [_app_session(f"session-{i}", created_at=f"2026-01-01T00:0{i}:00.000Z") for i in range(5)]
+    client.agent_sessions["issue-1"] = [
+        _app_session(f"session-{i}", created_at=f"2026-01-01T00:0{i}:00.000Z") for i in range(5)
+    ]
     adapter = _make_adapter(client=client, extra={"app_user_id": "app-1"})
     events = await _capture_events(adapter)
 
@@ -910,18 +914,33 @@ async def test_rule_delegated_session_refuses_an_unknown_issue_creator():
 
 
 @pytest.mark.asyncio
-async def test_rule_delegated_session_refuses_when_the_issue_creator_is_this_app():
+async def test_rule_delegated_self_filed_session_is_closed_with_one_response():
+    """ENG-2246: a rule delegates a self-filed issue back to the filing app.
+
+    The resolved sender is our own app user, so the session must never run as
+    work — but it must be ended with one closing `response` activity and a 200,
+    not silently left dead by a 403.
+    """
     client = _FakeLinearClient()
     client.issue_creators["issue-1"] = "app-1"
     # Even "allow every user" must not accept our own app as the sender.
     adapter = _rule_adapter(client, allow_all_users=True, allowed_users=["app-1"])
     events = await _capture_events(adapter)
+    payload = _rule_delegated_payload()
 
-    _, status = await _post(adapter, _rule_delegated_payload(), delivery_id="evt-rule")
+    response, status = await _post(adapter, payload, delivery_id="evt-rule")
     await _settle()
 
-    assert status == 403
+    assert status == 200
+    assert response == {"status": "ignored", "reason": "self-sender"}
     assert events == []
+    assert client.calls == [
+        (
+            "response",
+            "session-rule",
+            "Filed by this app itself; already routed by the filing session. No action in this session.",
+        )
+    ]
 
 
 @pytest.mark.asyncio
@@ -945,17 +964,22 @@ async def test_rule_delegated_peer_issue_creator_goes_through_the_handoff_cap():
 
 
 @pytest.mark.asyncio
-async def test_rule_delegated_session_refuses_when_the_issue_creator_lookup_fails():
+async def test_rule_delegated_session_closes_when_the_issue_creator_lookup_fails():
+    """The lookup failed, so the only sender evidence left is our own app
+    user: the session is closed with a response instead of being left dead."""
     client = _FakeLinearClient()
     client.issue_creator_error = RuntimeError("linear is down")
     adapter = _rule_adapter(client, allowed_users=["tom-1"])
     events = await _capture_events(adapter)
 
-    _, status = await _post(adapter, _rule_delegated_payload(), delivery_id="evt-rule")
+    response, status = await _post(adapter, _rule_delegated_payload(), delivery_id="evt-rule")
     await _settle()
 
-    assert status == 403
+    assert status == 200
+    assert response == {"status": "ignored", "reason": "self-sender"}
     assert events == []
+    assert [call[0] for call in client.calls] == ["response"]
+    assert client.calls[0][1] == "session-rule"
 
 
 @pytest.mark.asyncio
@@ -977,6 +1001,65 @@ async def test_prompted_self_echo_is_still_refused_even_with_an_allowed_issue_cr
 
     assert status == 403
     assert events == []
+    assert client.calls == []
+
+
+# ---------------------------------------------------------------------------
+# ENG-2246 — a `created` session this app started for itself (a self-filed
+# issue routed back by a triage rule) is closed with ONE response activity
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_self_sender_created_session_posts_one_closing_response_across_redelivery():
+    client = _FakeLinearClient()
+    adapter = _make_adapter(
+        client=client,
+        extra={"app_user_id": "app-1", "allow_all_users": True},
+    )
+    events = await _capture_events(adapter)
+    payload = _handoff_created_payload(session_id="session-self", comment_user_id="app-1")
+
+    response, status = await _post(adapter, payload, delivery_id="evt-self")
+
+    assert status == 200
+    assert response == {"status": "ignored", "reason": "self-sender"}
+    assert events == []
+    assert client.calls == [
+        (
+            "response",
+            "session-self",
+            "Filed by this app itself; already routed by the filing session. No action in this session.",
+        )
+    ]
+
+    # A Linear redelivery of the same delivery id must not post a second one.
+    redelivery_response, redelivery_status = await _post(adapter, payload, delivery_id="evt-self")
+    await _settle()
+
+    assert redelivery_status == 200
+    assert redelivery_response == {"status": "ignored", "reason": "self-sender"}
+    assert events == []
+    assert len(client.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_non_self_unauthorized_created_sender_still_gets_403_and_nothing():
+    """Every other rejection keeps its 403 — no activity, no dispatch."""
+    client = _FakeLinearClient()
+    adapter = _make_adapter(
+        client=client,
+        extra={"app_user_id": "app-1", "allow_all_users": False},
+    )
+    events = await _capture_events(adapter)
+
+    response, status = await _post(adapter, _created_payload(), delivery_id="evt-denied")
+    await _settle()
+
+    assert status == 403
+    assert response["error"] == "Unauthorized Linear user or team"
+    assert events == []
+    assert client.calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -1014,7 +1097,6 @@ async def test_clarify_with_choices_sends_select_signal_with_one_option_per_choi
     # The numbered list stays in the body as the free-text fallback.
     assert "1. frontend" in activity["body"]
     assert "2. backend" in activity["body"]
-
 
 
 @pytest.mark.asyncio
