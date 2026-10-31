@@ -16,6 +16,7 @@ import json
 import logging
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any
+from urllib.parse import urlsplit
 
 from .client import _UUID_RE
 from .registry import get_active_adapter
@@ -23,6 +24,9 @@ from .registry import get_active_adapter
 logger = logging.getLogger(__name__)
 
 _ATTRIBUTION = "Linear history will show the agent as author."
+
+# Body used by linear_agent_request_auth when the model passes no body.
+DEFAULT_AUTH_BODY = "Please authenticate to continue"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -966,6 +970,66 @@ async def linear_agent_set_session_links(*args, **kwargs) -> str:
         return f"✅ Attached {len(normalized)} link(s) to the Linear session."
     except Exception as e:
         return f"❌ Failed to set session links: {e}"
+
+
+def _is_safe_auth_url(url: str) -> bool:
+    """True when ``url`` is an absolute http(s) URL with a host and no spaces.
+
+    Guards the auth elicitation against non-web schemes (``javascript:``,
+    ``file:``) and relative/garbled input. Callers must NOT log the URL on
+    failure — OAuth links can carry credentials.
+    """
+    if not url or any(ch.isspace() for ch in url):
+        return False
+    parts = urlsplit(url)
+    return parts.scheme.lower() in {"http", "https"} and bool(parts.hostname)
+
+
+async def linear_agent_request_auth(*args, **kwargs) -> str:
+    """Ask the Linear user to authenticate by posting an auth elicitation.
+
+    Posts ONE ``elicitation`` activity with ``signal="auth"`` to the current
+    agent session. Call it as the LAST action of the turn, then stop: the user
+    resumes the session after authenticating.
+    """
+    kwargs = _merge_tool_args(args, kwargs)
+    session_id = _first(kwargs, "agent_session_id", "session_id", "id")
+    if not session_id:
+        return "❌ linear_agent_request_auth: missing agent_session_id (shown in your session prompt)"
+
+    url = str(kwargs.get("url") or "").strip()
+    if not _is_safe_auth_url(url):
+        # Never echo the URL: OAuth links can carry credentials.
+        return "❌ linear_agent_request_auth: url must be an absolute http(s) URL with a host"
+
+    body = str(kwargs.get("body") or "").strip() or DEFAULT_AUTH_BODY
+
+    # Key order is url, userId, providerName; null/blank keys are omitted.
+    signal_metadata: dict[str, Any] = {"url": url}
+    user_id = str(kwargs.get("user_id") or "").strip()
+    if user_id:
+        signal_metadata["userId"] = user_id
+    provider_name = str(kwargs.get("provider_name") or "").strip()
+    if provider_name:
+        signal_metadata["providerName"] = provider_name
+
+    client, _ = _client_and_policy()
+    try:
+        # Same activity path send_clarify uses; create_response is not gated by
+        # mutation_policy (activities into the agent's own session are protocol).
+        await client.create_response(
+            session_id,
+            body,
+            response_type="elicitation",
+            signal="auth",
+            signal_metadata=signal_metadata,
+        )
+        return (
+            f"✅ Auth request posted to session {session_id}. "
+            "Stop now; the user will resume the session after authenticating."
+        )
+    except Exception as e:
+        return f"❌ Failed to request authentication: {e}"
 
 
 # Linear Agent Plans statuses (AgentSessionUpdateInput.plan items). Canonical
@@ -1943,6 +2007,40 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
             ["agent_session_id", "links"],
         ),
         "🔗",
+    ),
+    (
+        linear_agent_request_auth,
+        _schema(
+            "linear_agent_request_auth",
+            "Ask the Linear user to authenticate by posting an auth elicitation with a connect URL. "
+            "Use it when a tool or integration returns an authentication/connect link the user must open. "
+            "Call it as the LAST action of the turn, then stop — the user resumes the session after "
+            "authenticating. Do not paste the URL as plain text. Use the Session ID from your prompt.",
+            {
+                "agent_session_id": {
+                    "type": "string",
+                    "description": "The agent session ID (shown in your session prompt)",
+                },
+                "url": {
+                    "type": "string",
+                    "description": "Absolute http(s) URL the user must open to authenticate.",
+                },
+                "provider_name": {
+                    "type": "string",
+                    "description": "Optional display name of the provider being connected (e.g. 'GitHub').",
+                },
+                "body": {
+                    "type": "string",
+                    "description": "Optional message shown to the user. Defaults to a generic prompt.",
+                },
+                "user_id": {
+                    "type": "string",
+                    "description": "Optional initiating user ID (the Initiating user ID from your prompt).",
+                },
+            },
+            ["agent_session_id", "url"],
+        ),
+        "🔐",
     ),
     (
         linear_agent_update_plan,

@@ -283,6 +283,7 @@ def test_all_tools_registered():
         "linear_agent_create_comment",
         "linear_agent_save_status_update",
         "linear_agent_set_session_links",
+        "linear_agent_request_auth",
         "linear_agent_update_plan",
         "linear_agent_list_release_pipelines",
         "linear_agent_delete_comment",
@@ -1312,3 +1313,223 @@ async def test_create_comment_parent_routing():
     r3 = await t.linear_agent_create_comment(issue_id="ENG-1", body="hi")
     assert "✅ Comment added to ENG-1" in r3
     assert client.calls[-1] == ("create_comment", "ENG-1", "hi", None, None)
+
+
+# ---------------------------------------------------------------------------
+# linear_agent_request_auth — post an `elicitation` with signal="auth"
+# ---------------------------------------------------------------------------
+
+
+class _FakeAuthClient(LinearGraphQLClient):
+    """Records create_response calls; can be told to raise."""
+
+    def __init__(self, error=None):
+        self.calls = []
+        self.error = error
+
+    async def create_response(
+        self,
+        agent_session_id,
+        content,
+        *,
+        response_type="response",
+        ephemeral=False,
+        signal=None,
+        signal_metadata=None,
+    ):
+        self.calls.append(
+            {
+                "agent_session_id": agent_session_id,
+                "content": content,
+                "response_type": response_type,
+                "ephemeral": ephemeral,
+                "signal": signal,
+                "signal_metadata": signal_metadata,
+            }
+        )
+        if self.error is not None:
+            raise self.error
+        return {"id": "act-1"}
+
+
+def _adapter_with_auth_client(**kwargs):
+    adapter = LinearAgentAdapter.__new__(LinearAgentAdapter)
+    adapter._client = _FakeAuthClient(**kwargs)
+    adapter._mutation_policy = None
+    set_active_adapter(adapter)
+    return adapter
+
+
+@pytest.mark.asyncio
+async def test_request_auth_url_only_posts_auth_elicitation():
+    from hermes_linear_agent import tools as t
+
+    adapter = _adapter_with_auth_client()
+    url = "https://auth.example.com/oauth?state=abc"
+
+    result = await t.linear_agent_request_auth(agent_session_id="session-1", url=url)
+
+    assert "✅ Auth request posted to session session-1" in result
+    assert len(adapter._client.calls) == 1
+    call = adapter._client.calls[0]
+    assert call["agent_session_id"] == "session-1"
+    assert call["response_type"] == "elicitation"
+    assert call["signal"] == "auth"
+    assert call["signal_metadata"] == {"url": url}
+    assert list(call["signal_metadata"]) == ["url"]
+    assert call["content"] == t.DEFAULT_AUTH_BODY == "Please authenticate to continue"
+
+
+@pytest.mark.asyncio
+async def test_request_auth_includes_user_and_provider_in_metadata_in_order():
+    from hermes_linear_agent import tools as t
+
+    adapter = _adapter_with_auth_client()
+    url = "https://auth.example.com/oauth"
+
+    await t.linear_agent_request_auth(
+        agent_session_id="session-1",
+        url=url,
+        provider_name="GitHub",
+        user_id="user-42",
+    )
+
+    metadata = adapter._client.calls[0]["signal_metadata"]
+    assert metadata == {"url": url, "userId": "user-42", "providerName": "GitHub"}
+    # Key order is url, userId, providerName.
+    assert list(metadata) == ["url", "userId", "providerName"]
+
+
+@pytest.mark.asyncio
+async def test_request_auth_omits_null_and_blank_metadata_values():
+    from hermes_linear_agent import tools as t
+
+    adapter = _adapter_with_auth_client()
+    url = "https://auth.example.com/oauth"
+
+    for kwargs in (
+        {"user_id": None, "provider_name": None},
+        {"provider_name": ""},
+        {"provider_name": "   "},
+        {"user_id": ""},
+    ):
+        await t.linear_agent_request_auth(agent_session_id="session-1", url=url, **kwargs)
+        metadata = adapter._client.calls[-1]["signal_metadata"]
+        assert metadata == {"url": url}, kwargs
+        assert None not in metadata.values()
+        assert "userId" not in metadata
+        assert "providerName" not in metadata
+
+
+@pytest.mark.asyncio
+async def test_request_auth_body_override_and_default():
+    from hermes_linear_agent import tools as t
+
+    adapter = _adapter_with_auth_client()
+    url = "https://auth.example.com/oauth"
+
+    await t.linear_agent_request_auth(agent_session_id="s", url=url, body="  Connect your GitHub  ")
+    assert adapter._client.calls[-1]["content"] == "Connect your GitHub"
+
+    for blank in (None, "", "   "):
+        await t.linear_agent_request_auth(agent_session_id="s", url=url, body=blank)
+        assert adapter._client.calls[-1]["content"] == t.DEFAULT_AUTH_BODY
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        "javascript:alert(1)",
+        "file:///etc/passwd",
+        "ftp://x.com/a",
+        "example.com/auth",
+        "",
+        "   ",
+        "https://",
+        "https://a b.com",
+    ],
+)
+async def test_request_auth_rejects_bad_urls_without_client_call(bad_url):
+    from hermes_linear_agent import tools as t
+
+    adapter = _adapter_with_auth_client()
+
+    result = await t.linear_agent_request_auth(agent_session_id="session-1", url=bad_url)
+
+    assert result.startswith("❌")
+    assert adapter._client.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "good_url",
+    [
+        "http://localhost:8080/callback?code=1",
+        "https://auth.example.com/oauth?state=abc&scope=repo",
+        "HTTPS://x.com/a",
+    ],
+)
+async def test_request_auth_accepts_http_and_https(good_url):
+    from hermes_linear_agent import tools as t
+
+    adapter = _adapter_with_auth_client()
+
+    result = await t.linear_agent_request_auth(agent_session_id="session-1", url=good_url)
+
+    assert result.startswith("✅")
+    assert len(adapter._client.calls) == 1
+    assert adapter._client.calls[0]["signal_metadata"] == {"url": good_url.strip()}
+
+
+@pytest.mark.asyncio
+async def test_request_auth_requires_session_id():
+    from hermes_linear_agent import tools as t
+
+    adapter = _adapter_with_auth_client()
+
+    result = await t.linear_agent_request_auth(url="https://auth.example.com/oauth")
+
+    assert result.startswith("❌")
+    assert "missing agent_session_id" in result
+    assert adapter._client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_request_auth_client_error_is_reported_not_raised():
+    from hermes_linear_agent import tools as t
+
+    secret_url = "https://auth.example.com/oauth?token=SUPERSECRET"
+    adapter = _adapter_with_auth_client(error=LinearApiError("boom"))
+
+    result = await t.linear_agent_request_auth(agent_session_id="session-1", url=secret_url)
+
+    assert result.startswith("❌")
+    assert "SUPERSECRET" not in result
+    assert secret_url not in result
+    # The attempt was made (one call) and did not raise out of the handler.
+    assert len(adapter._client.calls) == 1
+
+
+def test_request_auth_registered_schema_and_toolset():
+    from tools.registry import registry as tool_registry
+
+    from hermes_linear_agent import tools as t
+
+    captured = {}
+
+    class Ctx:
+        @staticmethod
+        def register_tool(*, name, toolset, schema, handler, **kwargs):
+            captured[name] = {"toolset": toolset, "schema": schema, "handler": handler}
+            tool_registry.register(name=name, toolset=toolset, schema=schema, handler=handler, **kwargs)
+
+    t.register_tools_with_context(Ctx())
+
+    entry = captured["linear_agent_request_auth"]
+    assert entry["toolset"] == "linear_agent"
+    assert entry["handler"].__name__ == "linear_agent_request_auth"
+    assert entry["schema"]["parameters"]["required"] == ["agent_session_id", "url"]
+    registered = tool_registry.get_entry("linear_agent_request_auth")
+    assert registered is not None
+    assert registered.is_async is True
