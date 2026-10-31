@@ -2342,7 +2342,12 @@ LINEAR_AGENT_TOOLSET_HINT = (
     "projects, cycles, users, labels, comments, attachments, customers, "
     "initiatives, and releases. Write tools are gated by the operator's "
     "mutation_policy and may be disabled; if a write is rejected, report "
-    "the policy message rather than retrying. "
+    "the policy message rather than retrying. If a tool returns an "
+    "authentication or connect URL that the user has to open, call "
+    "linear_agent_request_auth with that URL (pass the Initiating user ID "
+    "from the prompt as user_id) as the last action of the turn, then "
+    "stop. Do not paste the URL as plain text. When the session resumes, "
+    "your first activity should be a thought. "
 )
 PLATFORM_HINT_BASE_AFTER = (
     "When changing an issue's "

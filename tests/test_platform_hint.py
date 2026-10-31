@@ -21,7 +21,17 @@ from hermes_linear_agent.adapter import (
     register,
 )
 
-# The hint exactly as it shipped before P17 (captured from origin/main).
+# The sentence P18 adds to the toolset paragraph: the model is told to post an
+# authentication elicitation instead of pasting a connect URL as plain text.
+AUTH_HINT_SENTENCE = (
+    "If a tool returns an authentication or connect URL that the user has to open, call "
+    "linear_agent_request_auth with that URL (pass the Initiating user ID from the prompt as "
+    "user_id) as the last action of the turn, then stop. Do not paste the URL as plain text. "
+    "When the session resumes, your first activity should be a thought."
+)
+
+# The full hint as pinned after P17, plus the P18 auth sentence inside the
+# toolset paragraph (the paragraph is still the only part gated on the toolset).
 ORIGIN_MAIN_HINT = (
     'You are responding in a Linear Agent Session. Your final response text is delivered directly '
     "into the session's Linear thread — put the ACTUAL content of your reply there, never a narration "
@@ -39,7 +49,11 @@ ORIGIN_MAIN_HINT = (
     'linear_agent_list_* / linear_agent_get_* tools for teams, issues, projects, cycles, users, '
     'labels, comments, attachments, customers, initiatives, and releases. Write tools are gated by '
     "the operator's mutation_policy and may be disabled; if a write is rejected, report the policy "
-    "message rather than retrying. When changing an issue's status you may pass the state NAME (e.g. "
+    "message rather than retrying. If a tool returns an authentication or connect URL that the user "
+    "has to open, call linear_agent_request_auth with that URL (pass the Initiating user ID from "
+    "the prompt as user_id) as the last action of the turn, then stop. Do not paste the URL as "
+    "plain text. When the session resumes, your first activity should be a thought. "
+    "When changing an issue's status you may pass the state NAME (e.g. "
     "state: 'Done') — it is resolved to the correct stateId automatically; likewise pass priority as "
     "a NAME (e.g. priority: 'Low') — Linear's numeric scale is 0=None, 1=Urgent, 2=High, 3=Medium, "
     "4=Low, so a guessed number silently sets the wrong value. Never set yourself as an issue's "
@@ -65,6 +79,18 @@ class _PluginContext:
 
 def test_hint_with_the_toolset_on_is_the_origin_main_string():
     assert build_platform_hint(True) == ORIGIN_MAIN_HINT
+
+
+def test_auth_sentence_is_in_the_hint_when_the_toolset_is_on():
+    assert AUTH_HINT_SENTENCE in LINEAR_AGENT_TOOLSET_HINT
+    assert AUTH_HINT_SENTENCE in build_platform_hint(True)
+
+
+def test_auth_sentence_is_absent_when_the_toolset_is_off():
+    hint = build_platform_hint(False)
+
+    assert AUTH_HINT_SENTENCE not in hint
+    assert "linear_agent_request_auth" not in hint
 
 
 def test_hint_with_the_toolset_off_drops_only_that_paragraph():
@@ -96,8 +122,9 @@ def test_register_uses_the_gate_for_the_platform_hint(monkeypatch, enabled):
     assert ctx.registered["platform_hint"] == build_platform_hint(enabled)
 
 
-# The config shapes below are the ones seen live: gilfoyle/baxter save the platform list
-# without `linear_agent` and record it as "known" for the platform.
+# Config shapes: a saved platform list that omits `linear_agent` (the shape seen
+# before the toolset was enabled) resolves to False; a list that names it resolves
+# to True, no matter what `known_plugin_toolsets` records.
 
 
 def test_gilfoyle_shaped_config_resolves_to_false():
