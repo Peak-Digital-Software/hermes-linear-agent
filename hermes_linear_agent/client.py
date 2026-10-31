@@ -1058,7 +1058,7 @@ mutation AgentSessionUpdate($id: String!, $input: AgentSessionUpdateInput!) {
         q = """
         query Releases($first: Int, $filter: ReleaseFilter) {
           releases(first: $first, filter: $filter) {
-            nodes { id name description version stage targetDate createdAt url }
+            nodes { id name description version stage { id name type } targetDate createdAt url }
           }
         }
         """
@@ -1071,7 +1071,7 @@ mutation AgentSessionUpdate($id: String!, $input: AgentSessionUpdateInput!) {
         q = """
         query Release($id: String!) {
           release(id: $id) {
-            id name description version stage startDate targetDate completedAt createdAt url
+            id name description version stage { id name type } startDate targetDate completedAt createdAt url
           }
         }
         """
