@@ -1547,3 +1547,27 @@ def test_request_auth_registered_schema_and_toolset():
     registered = tool_registry.get_entry("linear_agent_request_auth")
     assert registered is not None
     assert registered.is_async is True
+
+
+@pytest.mark.asyncio
+async def test_release_queries_select_stage_subfields():
+    """Linear's Release.stage is a ReleaseStage object, so a bare `stage`
+    selection fails with HTTP 400 'must have a selection of subfields'."""
+    client = LinearGraphQLClient(access_token="test-token")
+    queries: list[str] = []
+
+    async def fake_execute(query, variables=None):
+        queries.append(query)
+        if "releases(" in query:
+            return {"releases": {"nodes": []}}
+        return {"release": None}
+
+    client.execute = fake_execute
+
+    await client.list_releases()
+    await client.get_release("rel-1")
+
+    assert len(queries) == 2
+    for query in queries:
+        normalized = " ".join(query.split())
+        assert "stage { id name type }" in normalized
