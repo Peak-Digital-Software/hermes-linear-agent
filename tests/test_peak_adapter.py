@@ -644,7 +644,9 @@ async def test_peer_is_allowed_and_non_peer_and_self_are_refused():
     assert status == 200
     assert len(events) == 1
 
-    stranger = _make_adapter(extra={"app_user_id": "app-1", "allow_all_users": False, "peer_app_user_ids": ["peer-1"]})
+    stranger = _make_adapter(
+        extra={"app_user_id": "app-1", "allow_all_users": False, "peer_app_user_ids": ["peer-1"]}
+    )
     stranger_events = await _capture_events(stranger)
     _, status = await _post(
         stranger,
@@ -752,9 +754,7 @@ async def test_handoff_cap_fails_closed_when_the_count_query_errors():
 async def test_human_sessions_never_hit_the_handoff_cap():
     """Only peer senders are capped; a human mention dispatches regardless."""
     client = _FakeLinearClient()
-    client.agent_sessions["issue-1"] = [
-        _app_session(f"session-{i}", created_at=f"2026-01-01T00:0{i}:00.000Z") for i in range(5)
-    ]
+    client.agent_sessions["issue-1"] = [_app_session(f"session-{i}", created_at=f"2026-01-01T00:0{i}:00.000Z") for i in range(5)]
     adapter = _make_adapter(client=client, extra={"app_user_id": "app-1"})
     events = await _capture_events(adapter)
 
@@ -1097,6 +1097,7 @@ async def test_clarify_with_choices_sends_select_signal_with_one_option_per_choi
     # The numbered list stays in the body as the free-text fallback.
     assert "1. frontend" in activity["body"]
     assert "2. backend" in activity["body"]
+
 
 
 @pytest.mark.asyncio

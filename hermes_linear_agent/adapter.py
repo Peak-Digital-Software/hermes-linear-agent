@@ -88,11 +88,6 @@ WAKE_TEXT_PREFIX = "[peak-agent wake] "
 # still has at most this many app-initiated sessions; beyond it a human has to
 # take over (two agents can otherwise ping an issue back and forth forever).
 DEFAULT_MAX_AGENT_HANDOFFS = 2
-# Closing activity for a `created` session this app started for itself (e.g. a
-# triage rule delegating a filed issue back to the filing app). The session is
-# never work, but Linear needs one activity so it completes instead of looking
-# like it failed to start. No app display name is configured, so "this app".
-SELF_SENDER_CLOSING_BODY = "Filed by this app itself; already routed by the filing session. No action in this session."
 # ── Core clarify text-fallback suppression (P17) ──────────────────────────────
 # Core's clarify lane re-sends the prompt as plain text when it classifies the
 # native send "failed". On Linear the native send SUCCEEDS (we post a real
@@ -110,7 +105,6 @@ CLARIFY_FALLBACK_SUPPRESS_SECONDS = 10.0
 def _clarify_now() -> float:
     """Monotonic clock for the clarify-suppression window (tests monkeypatch this)."""
     return time.monotonic()
-
 
 # All write operations fail closed: each key must be explicitly enabled.
 # `update_projects` also covers project updates (status updates), milestones,
@@ -894,7 +888,9 @@ class LinearAgentAdapter(BasePlatformAdapter):
             raw_response=comment,
         )
 
-    async def _resolve_reply_session(self, chat_id: str, metadata: dict[str, Any] | None = None) -> tuple[str, str]:
+    async def _resolve_reply_session(
+        self, chat_id: str, metadata: dict[str, Any] | None = None
+    ) -> tuple[str, str]:
         """Resolve ``(agent_session_id, issue_id)`` for an outbound reply.
 
         Tries the in-memory per-issue map first, then recovers this app's
@@ -949,7 +945,7 @@ class LinearAgentAdapter(BasePlatformAdapter):
         if _clarify_now() - posted_at > CLARIFY_FALLBACK_SUPPRESS_SECONDS:
             registry.pop(key, None)  # stale: a later clarify may reuse the issue id
             return False
-        if not content[len(CLARIFY_FALLBACK_PREFIX) :].startswith(question):
+        if not content[len(CLARIFY_FALLBACK_PREFIX):].startswith(question):
             return False
         registry.pop(key, None)
         return True
@@ -1450,20 +1446,6 @@ class LinearAgentAdapter(BasePlatformAdapter):
         context = await self._resolve_sender(context)
 
         if not self._webhook_sender_authorized(context):
-            # A `created` session this app started for itself (a triage rule
-            # delegating a filed issue back to the filing app) is never work:
-            # do not dispatch. But end it with ONE closing `response` activity
-            # so Linear marks the session complete instead of leaving it
-            # looking like it failed to start. Dedup first, as the normal path
-            # does, so a redelivery of the same delivery id cannot post twice.
-            if self._is_self_sender(context) and context.action == "created" and context.agent_session_id:
-                if not self._dedup.is_duplicate(context.delivery_id):
-                    await self._post_session_activity(context.agent_session_id, SELF_SENDER_CLOSING_BODY)
-                logger.info(
-                    "[linear_agent] Closed self-sender session %s with a no-action response",
-                    context.agent_session_id,
-                )
-                return {"status": "ignored", "reason": "self-sender"}, 200
             logger.warning(
                 "[linear_agent] Rejected webhook for unauthorized user/team user=%s team=%s",
                 context.actor_user_id,
@@ -1701,11 +1683,6 @@ class LinearAgentAdapter(BasePlatformAdapter):
             return "", ""
         return creator_id, "issue.creatorId"
 
-    def _is_self_sender(self, context: LinearWebhookContext) -> bool:
-        """True when the resolved sender is this app's own user."""
-        sender = str(context.actor_user_id or "").strip()
-        return bool(sender) and sender == self._app_user_id
-
     def _is_peer_sender(self, context: LinearWebhookContext) -> bool:
         """True when the sender is a listed peer app (and not ourselves)."""
         sender = str(context.actor_user_id or "").strip()
@@ -1764,7 +1741,8 @@ class LinearAgentAdapter(BasePlatformAdapter):
         )
         await self._post_session_activity(
             context.agent_session_id,
-            f"Handoff limit reached: this issue already has {count} agent-to-agent handoffs. Tom needs to step in.",
+            f"Handoff limit reached: this issue already has {count} agent-to-agent handoffs. "
+            "Tom needs to step in.",
         )
         return {"status": "refused", "reason": "handoff limit reached", "handoffs": count}
 
