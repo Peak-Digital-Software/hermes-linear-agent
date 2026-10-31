@@ -1512,6 +1512,19 @@ async def test_request_auth_client_error_is_reported_not_raised():
     assert len(adapter._client.calls) == 1
 
 
+@pytest.mark.asyncio
+async def test_request_auth_client_error_that_echoes_url_is_redacted():
+    from hermes_linear_agent import tools as t
+
+    secret_url = "https://auth.example.com/oauth?token=SUPERSECRET"
+    _adapter_with_auth_client(error=LinearApiError(f"bad input {secret_url}"))
+
+    result = await t.linear_agent_request_auth(agent_session_id="session-1", url=secret_url)
+
+    assert result.startswith("❌")
+    assert "SUPERSECRET" not in result
+
+
 def test_request_auth_registered_schema_and_toolset():
     from tools.registry import registry as tool_registry
 

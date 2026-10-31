@@ -1032,7 +1032,8 @@ async def linear_agent_request_auth(*args, **kwargs) -> str:
             "Stop now; the user will resume the session after authenticating."
         )
     except Exception as e:
-        return f"❌ Failed to request authentication: {e}"
+        # An upstream error can echo the request; never let the URL through.
+        return f"❌ Failed to request authentication: {str(e).replace(url, '<url>')}"
 
 
 # Linear Agent Plans statuses (AgentSessionUpdateInput.plan items). Canonical
