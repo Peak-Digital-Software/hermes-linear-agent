@@ -1571,3 +1571,28 @@ async def test_release_queries_select_stage_subfields():
     for query in queries:
         normalized = " ".join(query.split())
         assert "stage { id name type }" in normalized
+
+
+@pytest.mark.asyncio
+async def test_customer_queries_select_tier_and_status_subfields():
+    """Linear's Customer.tier / Customer.status are CustomerTier / CustomerStatus
+    objects, so bare scalar selections fail with HTTP 400."""
+    client = LinearGraphQLClient(access_token="test-token")
+    queries: list[str] = []
+
+    async def fake_execute(query, variables=None):
+        queries.append(query)
+        if "customers(" in query:
+            return {"customers": {"nodes": []}}
+        return {"customer": None}
+
+    client.execute = fake_execute
+
+    await client.list_customers()
+    await client.get_customer("cus-1")
+
+    assert len(queries) == 2
+    for query in queries:
+        normalized = " ".join(query.split())
+        assert "tier { id name }" in normalized
+        assert "status { id name }" in normalized
