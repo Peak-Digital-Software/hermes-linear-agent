@@ -1448,6 +1448,7 @@ async def test_request_auth_body_override_and_default():
         "   ",
         "https://",
         "https://a b.com",
+        "http://[::1",
     ],
 )
 async def test_request_auth_rejects_bad_urls_without_client_call(bad_url):

@@ -981,7 +981,10 @@ def _is_safe_auth_url(url: str) -> bool:
     """
     if not url or any(ch.isspace() for ch in url):
         return False
-    parts = urlsplit(url)
+    try:
+        parts = urlsplit(url)
+    except ValueError:  # e.g. unbalanced IPv6 bracket "http://[::1"
+        return False
     return parts.scheme.lower() in {"http", "https"} and bool(parts.hostname)
 
 
