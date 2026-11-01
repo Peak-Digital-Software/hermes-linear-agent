@@ -980,7 +980,7 @@ mutation AgentSessionUpdate($id: String!, $input: AgentSessionUpdateInput!) {
         q = """
         query Customers($first: Int, $filter: CustomerFilter) {
           customers(first: $first, filter: $filter) {
-            nodes { id name slugId tier status owner { id name } }
+            nodes { id name slugId tier { id name } status { id name } owner { id name } }
           }
         }
         """
@@ -993,7 +993,7 @@ mutation AgentSessionUpdate($id: String!, $input: AgentSessionUpdateInput!) {
         q = """
         query Customer($id: String!) {
           customer(id: $id) {
-            id name slugId tier status owner { id name } createdAt updatedAt
+            id name slugId tier { id name } status { id name } owner { id name } createdAt updatedAt
           }
         }
         """
