@@ -52,9 +52,10 @@ class _FakeKanbanSync:
 
     instances: list["_FakeKanbanSync"] = []
 
-    def __init__(self, client, team_key="ENG"):
+    def __init__(self, client, team_key="ENG", *, wake=None):
         self.client = client
         self.team_key = team_key
+        self.wake = wake
         self.payloads: list[dict] = []
         self.tasks: list[asyncio.Task] = []
         self.started = False
@@ -416,6 +417,9 @@ async def test_connect_starts_sync_tasks_when_enabled(monkeypatch):
         assert len(_FakeKanbanSync.instances) == 1
         sync = _FakeKanbanSync.instances[0]
         assert sync.client is adapter._client
+        # The sync wakes sessions through the adapter's own dispatcher (bound
+        # method), so issueUnblocked and child rollups reach a real turn.
+        assert sync.wake == adapter._dispatch_wake
         assert sync.started is True
         assert adapter._kanban is sync
         assert len(sync.tasks) == 2

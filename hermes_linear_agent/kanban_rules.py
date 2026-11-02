@@ -21,8 +21,25 @@ _CANCEL_TYPES: frozenset[str] = frozenset({"canceled", "duplicate"})
 #: The workflow state a blocked card puts its issue in.
 BLOCKED_STATE = "Blocked"
 
+#: ENG team Linear workflow state ids, by state name (ENG-2286).
+STATE_IDS: dict[str, str] = {
+    "Blocked": "8de0dfd6-614f-4d0d-9ee1-aee47a12bb58",
+    "Working": "f41a9dcb-10c9-41d9-a7cf-e83f0e49367a",
+    "Reviewing": "916a7971-5640-4989-a7ae-d8175499851f",
+    "Ready to Merge": "40c4ac3a-e45a-4817-a19b-7b94eb1bb0ed",
+    "Todo": "bb1c80eb-1a31-4616-9033-602a12b82ba0",
+    "Done": "975dfb59-166d-4df4-b70c-5382442448d8",
+    "Canceled": "7fc0e9b4-2d39-45dc-87aa-79a8d9c5ce5c",
+}
+
 #: Card statuses that mean the card can no longer change (D3).
 _CARD_CLOSED_STATUSES: frozenset[str] = frozenset({"done", "archived"})
+
+#: Open card statuses that make an issue "Todo" (row 4 of issue_status).
+_TODO_STATUSES: frozenset[str] = frozenset({"todo", "ready", "triage"})
+
+#: Child states that mean work has started, for rollup.
+_STARTED_STATES: frozenset[str] = frozenset({"Working", "Reviewing", "Ready to Merge"})
 
 #: Every kanban event this bridge acts on (watch.ts:54-68). Anything else —
 #: heartbeat, worker_bound, dependency_wait, ... — never reaches Linear.
@@ -124,38 +141,59 @@ def pr_gate(attachments: list[dict]) -> PrState:
 def issue_status(cards: list[Card], attachments: list[dict] | None = None) -> str | None:
     """The issue's Linear status, read from ALL of its cards.
 
-    ``None`` when the issue has no card at all, so nothing is touched. The
-    attachments gate Done: while any PR is open the issue stays in Reviewing
-    (ENG-2239).
+    ENG-2286: an eight-row precedence, first match wins.
+
+    1. any blocked card -> ``"Blocked"``
+    2. any running card -> ``"Working"``
+    3. any card in review -> ``"Reviewing"``
+    4. every open card is todo/ready/triage -> ``"Todo"``
+    5. every card completed and a PR is open -> ``"Ready to Merge"``
+    6. every card completed, PR merged or none -> ``"Done"``
+    7. every card archived and none completed -> ``"Canceled"``
+    8. no cards -> ``None``
+
+    ``None`` when the issue has no card at all, so nothing is touched. An
+    open card that matches none of rows 1-4 counts as active work
+    (``"Working"``). The attachments gate rows 5/6: while any PR is open the
+    issue sits in Ready to Merge (ENG-2239).
     """
     links = attachments if attachments is not None else []
 
-    def done() -> str:
-        return "Reviewing" if pr_gate(links) == "open" else "Done"
-
     if not cards:
         return None
-    if all(is_completed(card) for card in cards):
-        return done()
-
-    remaining = [card for card in cards if is_open(card)]
-    if not remaining:
-        # Nothing is open: the issue was canceled only when EVERY card was
-        # archived without completing. One completed card is real work
-        # whatever dead duplicate was archived beside it, so that is Done
-        # (ENG-2230, ENG-2234).
-        if all(card.status == "archived" and not is_completed(card) for card in cards):
-            return "Canceled"
-        return done()
-
-    if all(card.assignee == "reviewer" for card in remaining):
+    if any(card.status == "blocked" for card in cards):
+        return "Blocked"
+    if any(card.status == "running" for card in cards):
+        return "Working"
+    if any(card.status == "review" for card in cards):
         return "Reviewing"
+
+    open_cards = [card for card in cards if is_open(card)]
+    if open_cards and all(card.status in _TODO_STATUSES for card in open_cards):
+        return "Todo"
+
+    # Rows 5/6 need every card closed with real work done. One completed
+    # card is real work whatever dead duplicate was archived beside it
+    # (ENG-2230, ENG-2234); only an all-archived, never-completed set is
+    # Canceled (row 7).
+    if not open_cards and not all(card.status == "archived" and not is_completed(card) for card in cards):
+        return "Ready to Merge" if pr_gate(links) == "open" else "Done"
+    if not open_cards:
+        return "Canceled"
+
     return "Working"
 
 
-def with_blocked(cards: list[Card], status: str | None) -> str | None:
-    """The issue's status while any card is blocked, else the given status.
+def rollup(child_states: list[str]) -> str | None:
+    """The parent card's status, rolled up from its child cards (ENG-2286).
 
-    Nothing is invented for an issue with no card.
+    ``"Blocked"`` when any child is blocked; ``"Working"`` when any child has
+    started (Working, Reviewing or Ready to Merge); ``None`` otherwise, so
+    the parent is left untouched (all children done/canceled, none started,
+    or no children at all — the parent session closes the parent).
     """
-    return BLOCKED_STATE if any(card.status == "blocked" for card in cards) else status
+    if BLOCKED_STATE in child_states:
+        return BLOCKED_STATE
+    if any(state in _STARTED_STATES for state in child_states):
+        return "Working"
+    return None

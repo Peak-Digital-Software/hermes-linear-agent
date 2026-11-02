@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sqlite3
 from pathlib import Path
 
@@ -239,122 +240,83 @@ def state_dir(tmp_path, monkeypatch):
     return tmp_path
 
 
-def test_cursor_is_persisted_per_board_and_other_boards_are_kept(state_dir):
-    assert kanban_cli.load_cursor("alpha") is None
-    kanban_cli.save_cursor("alpha", 5)
-    kanban_cli.save_cursor("beta", 9)
+def _db(tmp_path: Path) -> Path:
+    path = tmp_path / "kanban.db"
+    path.write_text("")
+    return path
 
-    assert kanban_cli.load_cursor("alpha") == 5
-    assert kanban_cli.load_cursor("beta") == 9
-    assert json.loads((state_dir / "watch-cursor.json").read_text()) == {"alpha": 5, "beta": 9}
+
+def test_cursor_is_persisted_per_board_and_other_boards_are_kept(state_dir, tmp_path):
+    db = _db(tmp_path)
+    key = f"alpha@{os.stat(db).st_ino}"
+    beta_key = f"beta@{os.stat(db).st_ino}"
+
+    assert kanban_cli.load_cursor("alpha", str(db)) is None
+    kanban_cli.save_cursor("alpha", str(db), 5)
+    kanban_cli.save_cursor("beta", str(db), 9)
+
+    assert kanban_cli.load_cursor("alpha", str(db)) == 5
+    assert kanban_cli.load_cursor("beta", str(db)) == 9
+    assert json.loads((state_dir / "watch-cursor.json").read_text()) == {key: 5, beta_key: 9}
     assert not list(state_dir.glob("*.tmp")), "the write is a rename, no temp file is left behind"
 
 
-def test_corrupt_cursor_file_is_ignored_not_fatal(state_dir):
+def test_load_cursor_migrates_a_bare_slug_key(state_dir, tmp_path):
+    db = _db(tmp_path)
+    (state_dir / "watch-cursor.json").write_text(json.dumps({"alpha": 5}))
+
+    assert kanban_cli.load_cursor("alpha", str(db)) == 5
+
+
+def test_save_cursor_migrates_a_bare_slug_key_and_keeps_other_boards(state_dir, tmp_path):
+    db = _db(tmp_path)
+    inode = os.stat(db).st_ino
+    other_key = f"beta@{inode}"
+    (state_dir / "watch-cursor.json").write_text(json.dumps({"alpha": 5, other_key: 3}))
+
+    kanban_cli.save_cursor("alpha", str(db), 9)
+
+    assert json.loads((state_dir / "watch-cursor.json").read_text()) == {f"alpha@{inode}": 9, other_key: 3}
+
+
+def test_cursor_does_not_carry_over_to_a_recreated_board_db(state_dir, tmp_path):
+    db = _db(tmp_path)
+    old_inode = os.stat(db).st_ino
+    kanban_cli.save_cursor("alpha", str(db), 5)
+
+    db.unlink()
+    db.write_text("")
+    assert os.stat(db).st_ino != old_inode, "re-creating the file must produce a new inode"
+
+    assert kanban_cli.load_cursor("alpha", str(db)) is None
+
+
+def test_cursor_falls_back_to_the_bare_slug_when_stat_fails(state_dir, tmp_path):
+    missing = str(tmp_path / "missing.db")
+    (state_dir / "watch-cursor.json").write_text(json.dumps({"alpha": 7, "beta": 2}))
+
+    assert kanban_cli.load_cursor("alpha", missing) == 7
+
+    kanban_cli.save_cursor("alpha", missing, 9)
+
+    assert json.loads((state_dir / "watch-cursor.json").read_text()) == {"alpha": 9, "beta": 2}
+
+
+def test_corrupt_cursor_file_is_ignored_not_fatal(state_dir, tmp_path):
     (state_dir / "watch-cursor.json").write_text("not json")
 
-    assert kanban_cli.load_cursor("alpha") is None
+    assert kanban_cli.load_cursor("alpha", str(_db(tmp_path))) is None
 
 
-def test_save_cursor_recovers_from_a_corrupt_file(state_dir):
+def test_save_cursor_recovers_from_a_corrupt_file(state_dir, tmp_path):
+    db = _db(tmp_path)
     (state_dir / "watch-cursor.json").write_text("not json")
 
-    kanban_cli.save_cursor("alpha", 3)
+    kanban_cli.save_cursor("alpha", str(db), 3)
 
-    assert json.loads((state_dir / "watch-cursor.json").read_text()) == {"alpha": 3}
+    assert json.loads((state_dir / "watch-cursor.json").read_text()) == {f"alpha@{os.stat(db).st_ino}": 3}
 
 
 def test_cursor_defaults_to_the_linear_agent_state_dir(monkeypatch, tmp_path):
     monkeypatch.delenv("PEAK_AGENT_STATE_DIR", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
-
-    assert kanban_cli._cursor_file() == tmp_path / ".local" / "state" / "linear-agent" / "watch-cursor.json"
-
-
-# --- follower ------------------------------------------------------------
-
-
-async def test_follow_cold_start_seeds_at_max_id_and_handles_only_later_rows(tmp_path, state_dir):
-    path = board_db(tmp_path)
-    add_task(path, "t_a", "coder", "ENG-1")
-    for _ in range(3):
-        add_event(path, "t_a", "created")
-
-    seen: list[int] = []
-    stop = asyncio.Event()
-
-    async def on_event(row):
-        seen.append(row["id"])
-        stop.set()
-
-    task = asyncio.create_task(
-        kanban_cli.follow("peak-agent-tools", on_event, db_path=str(path), interval=0.01, stop=stop)
-    )
-    await asyncio.sleep(0.05)
-    assert seen == [], "history is not replayed on a cold start"
-
-    add_event(path, "t_a", "completed")
-    await asyncio.wait_for(task, timeout=2)
-
-    assert seen == [4]
-    assert kanban_cli.load_cursor("peak-agent-tools") == 4
-
-
-async def test_follow_resumes_from_the_saved_cursor(tmp_path, state_dir):
-    path = board_db(tmp_path)
-    add_task(path, "t_a", "coder", "ENG-1")
-    add_event(path, "t_a", "created")
-    add_event(path, "t_a", "claimed")
-    kanban_cli.save_cursor("peak-agent-tools", 0)
-
-    seen: list[int] = []
-    stop = asyncio.Event()
-
-    async def on_event(row):
-        seen.append(row["id"])
-        if len(seen) == 2:
-            stop.set()
-
-    await asyncio.wait_for(
-        kanban_cli.follow("peak-agent-tools", on_event, db_path=str(path), interval=0.01, stop=stop), timeout=2
-    )
-
-    assert seen == [1, 2]
-    assert kanban_cli.load_cursor("peak-agent-tools") == 2
-
-
-async def test_follow_logs_an_event_failure_and_still_advances(tmp_path, state_dir, caplog):
-    path = board_db(tmp_path)
-    add_task(path, "t_a", "coder", "ENG-1")
-    add_event(path, "t_a", "created")
-    add_event(path, "t_a", "claimed")
-    kanban_cli.save_cursor("peak-agent-tools", 0)
-
-    seen: list[int] = []
-    stop = asyncio.Event()
-
-    async def on_event(row):
-        seen.append(row["id"])
-        if row["id"] == 1:
-            raise RuntimeError("Linear is down")
-        stop.set()
-
-    with caplog.at_level("ERROR"):
-        await asyncio.wait_for(
-            kanban_cli.follow("peak-agent-tools", on_event, db_path=str(path), interval=0.01, stop=stop), timeout=2
-        )
-
-    assert seen == [1, 2]
-    assert kanban_cli.load_cursor("peak-agent-tools") == 2
-    assert "error: watch peak-agent-tools t_a: Linear is down" in caplog.text
-
-
-async def test_follow_returns_immediately_when_stop_is_already_set(tmp_path, state_dir):
-    path = board_db(tmp_path)
-    stop = asyncio.Event()
-    stop.set()
-
-    async def on_event(row):  # pragma: no cover - must not run
-        raise AssertionError("must not handle")
-
-    await kanban_cli.follow("peak-agent-tools", on_event, db_path=str(path), interval=0.01, stop=stop)

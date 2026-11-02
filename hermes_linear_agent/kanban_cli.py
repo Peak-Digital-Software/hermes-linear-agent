@@ -8,8 +8,9 @@ Behaviour ported from peak-agent's `hermes.ts` and `cursor.ts`:
   still visible through its archived card;
 * events are read straight from ``task_events`` with the same query Hermes'
   own watcher uses, on a read-only SQLite connection;
-* the cursor is one flat ``{board: event_id}`` JSON file, written via tmp +
-  rename so a crash cannot truncate it.
+* the cursor is one flat ``{board@inode: event_id}`` JSON file, written via
+  tmp + rename so a crash cannot truncate it; a bare board slug is migrated
+  on the next save.
 """
 
 from __future__ import annotations
@@ -17,15 +18,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-import logging
 import os
 import sqlite3
 from pathlib import Path
 from typing import Any
 
 from .kanban_rules import Card
-
-log = logging.getLogger(__name__)
 
 TIMEOUT_SECONDS = 60.0
 
@@ -174,21 +172,40 @@ def _cursor_file() -> Path:
     return _state_dir() / STATE_FILE
 
 
-def load_cursor(board: str) -> int | None:
+def _cursor_key(board: str, db_path: str) -> str:
+    """``board@inode``; a missing db falls back to the bare slug."""
+    try:
+        inode = os.stat(db_path).st_ino
+    except OSError:
+        return board
+    return f"{board}@{inode}"
+
+
+def _coerce_event_id(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and not value.is_integer():
+        return None
+    return int(value)
+
+
+def load_cursor(board: str, db_path: str) -> int | None:
     """The board's last handled event id, or None when nothing is saved/corrupt."""
     try:
         parsed = json.loads(_cursor_file().read_text())
     except (OSError, ValueError):
         return None
-    event_id = parsed.get(board) if isinstance(parsed, dict) else None
-    if isinstance(event_id, bool) or not isinstance(event_id, (int, float)):
+    if not isinstance(parsed, dict):
         return None
-    if isinstance(event_id, float) and not event_id.is_integer():
-        return None
-    return int(event_id)
+    key = _cursor_key(board, db_path)
+    if key not in parsed and key != board:
+        # Migration: honour the pre-inode bare slug key when the inode key
+        # has not been written yet.
+        key = board
+    return _coerce_event_id(parsed.get(key))
 
 
-def save_cursor(board: str, event_id: int) -> None:
+def save_cursor(board: str, db_path: str, event_id: int) -> None:
     """Persist the board's cursor via tmp + rename; other boards are kept."""
     file = _cursor_file()
     cursors: dict[str, Any] = {}
@@ -199,70 +216,12 @@ def save_cursor(board: str, event_id: int) -> None:
     except (OSError, ValueError):
         # no state yet, or corrupt: start over rather than crash the watcher
         pass
-    cursors[board] = event_id
+    key = _cursor_key(board, db_path)
+    cursors[key] = event_id
+    if key != board:
+        # Migration: the inode key replaces the bare slug key.
+        cursors.pop(board, None)
     file.parent.mkdir(parents=True, exist_ok=True)
     tmp = file.with_name(f"{file.name}.{os.getpid()}.tmp")
     tmp.write_text(json.dumps(cursors))
     tmp.replace(file)
-
-
-# --- follower ------------------------------------------------------------
-
-
-def _error_line(error: BaseException) -> str:
-    """One safe line for the log, like watch.ts does."""
-    text = str(error) or error.__class__.__name__
-    for line in text.splitlines():
-        line = line.strip()
-        if line and not line.startswith("Command failed:"):
-            return line[:200]
-    return "unknown error"
-
-
-async def _pause(interval: float, stop: asyncio.Event | None) -> None:
-    if stop is None:
-        await asyncio.sleep(interval)
-        return
-    with contextlib.suppress(TimeoutError):
-        await asyncio.wait_for(stop.wait(), timeout=interval)
-
-
-async def follow(
-    board: str,
-    on_event,
-    *,
-    db_path: str | None = None,
-    interval: float = 1.0,
-    stop: asyncio.Event | None = None,
-) -> None:
-    """Follow a board's events until ``stop`` is set.
-
-    Resumes from the saved cursor; on a cold start it seeds at ``MAX(id)`` so
-    history is not replayed. A failing ``on_event`` is logged and the cursor
-    still advances, exactly like the TypeScript watcher.
-    """
-    if stop is not None and stop.is_set():
-        return
-    if db_path is None:
-        db_path = await db_path_for(board)
-    cursor = load_cursor(board)
-    if cursor is None:
-        cursor = max_event_id(db_path)
-
-    while stop is None or not stop.is_set():
-        rows = read_events(db_path, cursor)
-        if not rows:
-            await _pause(interval, stop)
-            continue
-        for row in rows:
-            try:
-                await on_event(row)
-            except Exception as error:  # noqa: BLE001 - one bad event must not stop the follower
-                log.error("error: watch %s %s: %s", board, row["task_id"], _error_line(error))
-            cursor = max(cursor, row["id"])
-            try:
-                save_cursor(board, cursor)
-            except Exception as error:  # noqa: BLE001 - losing the cursor is not fatal
-                log.error("error: watch %s: cursor not saved: %s", board, _error_line(error))
-            if stop is not None and stop.is_set():
-                break

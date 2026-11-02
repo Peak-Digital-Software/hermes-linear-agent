@@ -2,18 +2,24 @@
 
 Ports the bridge's issuesync/webhook routing, watch/boardwatch and reconcile
 cases. ``kanban_cli`` is monkeypatched at module level; Linear is a fake client
-whose ``execute`` answers by GraphQL operation name.
+whose ``execute`` answers by GraphQL operation name. The filesystem watcher is
+injectable (``kanban_sync._awatch``) so the loops can be driven by hand; the
+boards-root and board-db watches are also exercised against real temp dirs.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
+import sqlite3
+from pathlib import Path
 from typing import Any
 
 import pytest
+import watchfiles
 
-from hermes_linear_agent import kanban_cli
+from hermes_linear_agent import kanban_cli, kanban_sync
 from hermes_linear_agent.kanban_rules import Card
 from hermes_linear_agent.kanban_sync import KanbanSync
 
@@ -26,6 +32,7 @@ STATES: list[tuple[str, str, str]] = [
     ("Working", "s-working", "started"),
     ("Reviewing", "s-reviewing", "started"),
     ("Blocked", "s-blocked", "started"),
+    ("Ready to Merge", "s-ready-to-merge", "started"),
     ("Done", "s-done", "completed"),
     ("Canceled", "s-canceled", "canceled"),
     ("Duplicate", "s-duplicate", "duplicate"),
@@ -77,6 +84,9 @@ class FakeClient:
         active_pages: dict[str | None, dict[str, Any]] | None = None,
         fail_active: Exception | None = None,
         delay: float = 0.0,
+        issue_states: dict[str, dict[str, str]] | None = None,
+        parents: dict[str, dict[str, str]] | None = None,
+        children: dict[str, list[dict[str, Any]]] | None = None,
     ) -> None:
         self.current = {key: state(name) for key, name in (current or {}).items()}
         self.states = states if states is not None else STATES
@@ -86,6 +96,12 @@ class FakeClient:
         self.active_pages = active_pages or {}
         self.fail_active = fail_active
         self.delay = delay
+        # issue id ("issue-ENG-1") -> state, for issues that are not in `current`
+        self.issue_states = issue_states or {}
+        # issue key or id -> {"id": ..., "identifier": ...}
+        self.parents = parents or {}
+        # parent key or id -> child nodes
+        self.children = children or {}
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.updates: list[dict[str, str]] = []
         self.active_calls = 0
@@ -120,13 +136,17 @@ class FakeClient:
 
         if query.startswith("query Issue("):
             key = str(variables["id"])
-            node = self.current.get(key) or state("Todo")
+            issue_id = key if key.startswith("issue-") else f"issue-{key}"
+            identifier = key.removeprefix("issue-") if key.startswith("issue-") else key
+            node = self.current.get(identifier) or self.issue_states.get(issue_id) or state("Todo")
             return {
                 "issue": {
-                    "id": f"issue-{key}",
-                    "identifier": key,
+                    "id": issue_id,
+                    "identifier": identifier,
                     "state": node,
                     "team": {"id": "team-eng", "key": "ENG"},
+                    "parent": self.parents.get(identifier) or self.parents.get(issue_id),
+                    "children": {"nodes": self.children.get(issue_id) or self.children.get(identifier) or []},
                 }
             }
 
@@ -169,6 +189,8 @@ class Boards:
 
     def __init__(self) -> None:
         self.slugs: list[str] = [BOARD]
+        self.archived: set[str] = set()
+        self.paths: dict[str, str] = {}
         self.cards_by: dict[tuple[str, str], list[Card]] = {}
         self.shows: dict[str, dict[str, Any]] = {}
         self.events: dict[str, list[dict[str, Any]]] = {}
@@ -177,8 +199,11 @@ class Boards:
         self.archive_calls: list[tuple[str, list[str]]] = []
         self.saved: list[tuple[str, int]] = []
 
+    def db_path(self, slug: str) -> str:
+        return self.paths.get(slug, f"/tmp/{slug}.db")
+
     def rows(self) -> list[dict[str, Any]]:
-        return [{"slug": slug, "db_path": f"/tmp/{slug}.db"} for slug in self.slugs]
+        return [{"slug": slug, "db_path": self.db_path(slug), "archived": slug in self.archived} for slug in self.slugs]
 
     async def boards(self) -> list[dict[str, Any]]:
         self.boards_calls += 1
@@ -200,37 +225,112 @@ class Boards:
                 for card in cards
             ]
 
+    def _slug_for(self, db_path: str) -> str:
+        for slug, path in self.paths.items():
+            if path == db_path:
+                return slug
+        return db_path.removeprefix("/tmp/").removesuffix(".db")
+
     def read_events(self, db_path: str, after: int, limit: int = 200) -> list[dict[str, Any]]:
-        board = db_path.removeprefix("/tmp/").removesuffix(".db")
+        board = self._slug_for(db_path)
         return [row for row in self.events.get(board, []) if row["id"] > after][:limit]
 
     def max_event_id(self, db_path: str) -> int:
-        board = db_path.removeprefix("/tmp/").removesuffix(".db")
+        board = self._slug_for(db_path)
         return max((row["id"] for row in self.events.get(board, [])), default=0)
 
-    def load_cursor(self, board: str) -> int | None:
+    def load_cursor(self, board: str, db_path: str) -> int | None:
         return self.cursors.get(board)
 
-    def save_cursor(self, board: str, event_id: int) -> None:
+    def save_cursor(self, board: str, db_path: str, event_id: int) -> None:
         self.cursors[board] = event_id
         self.saved.append((board, event_id))
 
 
 @pytest.fixture
-def boards(monkeypatch) -> Boards:
+def cli(monkeypatch) -> Boards:
+    """The CLI plane's boards/cards/show/archive, in memory."""
     fake = Boards()
     monkeypatch.setattr(kanban_cli, "boards", fake.boards)
     monkeypatch.setattr(kanban_cli, "cards", fake.cards)
     monkeypatch.setattr(kanban_cli, "show", fake.show)
     monkeypatch.setattr(kanban_cli, "archive", fake.archive)
-    monkeypatch.setattr(kanban_cli, "read_events", fake.read_events)
-    monkeypatch.setattr(kanban_cli, "max_event_id", fake.max_event_id)
-    monkeypatch.setattr(kanban_cli, "load_cursor", fake.load_cursor)
-    monkeypatch.setattr(kanban_cli, "save_cursor", fake.save_cursor)
     return fake
 
 
-async def until(ready, timeout: float = 2.0) -> None:
+@pytest.fixture
+def boards(cli, monkeypatch) -> Boards:
+    """The CLI plane plus its event reads and cursors, in memory."""
+    monkeypatch.setattr(kanban_cli, "read_events", cli.read_events)
+    monkeypatch.setattr(kanban_cli, "max_event_id", cli.max_event_id)
+    monkeypatch.setattr(kanban_cli, "load_cursor", cli.load_cursor)
+    monkeypatch.setattr(kanban_cli, "save_cursor", cli.save_cursor)
+    return cli
+
+
+class FakeWatch:
+    """An injectable ``awatch``: every ``yield_change`` releases one batch."""
+
+    def __init__(self) -> None:
+        self.queues: list[asyncio.Queue[None]] = []
+
+    def __call__(self, *paths, **kwargs):
+        queue: asyncio.Queue[None] = asyncio.Queue()
+        self.queues.append(queue)
+        return self._batches(queue)
+
+    @staticmethod
+    async def _batches(queue: asyncio.Queue[None]):
+        while True:
+            await queue.get()
+            yield set()
+
+    def yield_change(self) -> None:
+        for queue in self.queues:
+            queue.put_nowait(None)
+
+
+@pytest.fixture
+def watch(monkeypatch) -> FakeWatch:
+    fake = FakeWatch()
+    monkeypatch.setattr(kanban_sync, "_awatch", fake)
+    return fake
+
+
+@pytest.fixture
+def idle_watch(monkeypatch):
+    """A watcher that never fires: the follower is driven by its initial read."""
+
+    async def never(*paths, **kwargs):
+        await asyncio.Event().wait()
+        yield set()  # pragma: no cover
+
+    monkeypatch.setattr(kanban_sync, "_awatch", never)
+    return never
+
+
+@pytest.fixture
+def watching(monkeypatch) -> asyncio.Event:
+    """The real watcher, wrapped so a test can wait until a watch has started."""
+    started = asyncio.Event()
+    real = watchfiles.awatch
+
+    async def wrapped(*paths, **kwargs):
+        started.set()
+        async for changes in real(*paths, **kwargs):
+            yield changes
+
+    monkeypatch.setattr(kanban_sync, "_awatch", wrapped)
+    return started
+
+
+@pytest.fixture
+def state_dir(tmp_path, monkeypatch) -> Path:
+    monkeypatch.setenv("PEAK_AGENT_STATE_DIR", str(tmp_path / "state"))
+    return tmp_path / "state"
+
+
+async def until(ready, timeout: float = 3.0) -> None:
     deadline = asyncio.get_running_loop().time() + timeout
     while not ready():
         if asyncio.get_running_loop().time() > deadline:
@@ -252,10 +352,16 @@ def issue_payload(
     was_state: str | None = None,
     now_state: str | None = None,
     kind: str = "Issue",
+    parent_id: str | None = None,
+    parent: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     data: dict[str, Any] = {"identifier": identifier}
     if now_state is not None:
         data["stateId"] = now_state
+    if parent_id is not None:
+        data["parentId"] = parent_id
+    if parent is not None:
+        data["parent"] = parent
     payload: dict[str, Any] = {"type": kind, "action": action, "data": data}
     if was_state is not None:
         payload["updatedFrom"] = {"stateId": was_state}
@@ -380,6 +486,54 @@ async def test_a_state_type_is_resolved_once_per_process(boards):
     assert [variables["id"] for variables in client.operations("WorkflowState")] == ["s-working", "s-done"]
 
 
+# -- child Done -> wake the parent --------------------------------------------
+
+
+async def test_a_child_moving_to_done_wakes_the_parent_session(boards):
+    woke: list[tuple[str, str, str]] = []
+    sync = KanbanSync(FakeClient(), wake=lambda *args: woke.append(args))
+    boards.cards_by[(BOARD, "ENG-2")] = [card("t_2", "ready")]
+
+    payload = issue_payload(
+        "ENG-2",
+        was_state="s-working",
+        now_state="s-done",
+        parent_id="issue-ENG-1",
+        parent={"id": "issue-ENG-1", "identifier": "ENG-1"},
+    )
+    line = await sync.handle_issue_webhook(payload)
+
+    assert line == "route ENG-2: close: archived 1"
+    assert woke == [("issue-ENG-1", "ENG-1", "[sync] ENG-2 is Done.")]
+
+
+async def test_a_child_done_without_an_embedded_parent_fetches_its_key_once(boards):
+    woke: list[tuple[str, str, str]] = []
+    client = FakeClient()
+    sync = KanbanSync(client, wake=lambda *args: woke.append(args))
+    boards.cards_by[(BOARD, "ENG-2")] = [card("t_2", "ready")]
+
+    await sync.handle_issue_webhook(
+        issue_payload("ENG-2", was_state="s-working", now_state="s-done", parent_id="issue-ENG-1")
+    )
+
+    assert woke == [("issue-ENG-1", "ENG-1", "[sync] ENG-2 is Done.")]
+    assert [variables["id"] for variables in client.operations("Issue")] == ["issue-ENG-1"]
+
+
+async def test_without_a_wake_callable_a_child_done_touches_no_parent(boards):
+    client = FakeClient()
+    sync = KanbanSync(client)
+    boards.cards_by[(BOARD, "ENG-2")] = [card("t_2", "ready")]
+
+    line = await sync.handle_issue_webhook(
+        issue_payload("ENG-2", was_state="s-working", now_state="s-done", parent_id="issue-ENG-1")
+    )
+
+    assert line == "route ENG-2: close: archived 1"
+    assert client.operations("Issue") == []
+
+
 # -- card events -> issue status ----------------------------------------------
 
 
@@ -456,7 +610,29 @@ async def test_an_unblock_returns_to_the_card_set_status(boards):
 
     await sync._handle_event(BOARD, event(1, "t_1", "unblocked"))
 
-    assert client.updates == [{"id": "issue-ENG-1", "stateId": "s-working"}]
+    assert client.updates == [{"id": "issue-ENG-1", "stateId": "s-todo"}]
+
+
+async def test_a_todo_card_set_writes_todo(boards):
+    client = FakeClient(current={"ENG-1": "Working"})
+    sync = KanbanSync(client)
+    boards.shows["t_1"] = {"id": "t_1", "tenant": "ENG-1", "completed": False}
+    boards.cards_by[(BOARD, "ENG-1")] = [card("t_1", "todo", "coder"), card("t_2", "ready", "coder")]
+
+    await sync._handle_event(BOARD, event(1, "t_1", "created"))
+
+    assert client.updates == [{"id": "issue-ENG-1", "stateId": "s-todo"}]
+
+
+async def test_a_review_card_writes_reviewing_whatever_its_assignee(boards):
+    client = FakeClient(current={"ENG-1": "Working"})
+    sync = KanbanSync(client)
+    boards.shows["t_1"] = {"id": "t_1", "tenant": "ENG-1", "completed": False}
+    boards.cards_by[(BOARD, "ENG-1")] = [card("t_1", "review", "oracle")]
+
+    await sync._handle_event(BOARD, event(1, "t_1", "review_requested"))
+
+    assert client.updates == [{"id": "issue-ENG-1", "stateId": "s-reviewing"}]
 
 
 async def test_a_team_without_blocked_state_is_a_silent_no_op(boards, caplog):
@@ -485,7 +661,7 @@ async def test_d7_a_card_event_never_writes_to_a_closed_issue(boards):
     assert client.updates == []
 
 
-async def test_an_open_pr_holds_a_completed_card_set_in_reviewing(boards):
+async def test_an_open_pr_holds_a_completed_card_set_in_ready_to_merge(boards):
     client = FakeClient(
         current={"ENG-1": "Working"},
         attachments={"issue-ENG-1": [REPO_LINK, pr_link(156, "open")]},
@@ -496,11 +672,11 @@ async def test_an_open_pr_holds_a_completed_card_set_in_reviewing(boards):
 
     await sync._handle_event(BOARD, event(1, "t_1", "completed"))
 
-    assert client.updates == [{"id": "issue-ENG-1", "stateId": "s-reviewing"}]
+    assert client.updates == [{"id": "issue-ENG-1", "stateId": "s-ready-to-merge"}]
 
 
 async def test_a_merged_pr_lets_the_completed_card_set_reach_done(boards):
-    client = FakeClient(current={"ENG-1": "Reviewing"}, attachments={"issue-ENG-1": [pr_link(156, "merged")]})
+    client = FakeClient(current={"ENG-1": "Ready to Merge"}, attachments={"issue-ENG-1": [pr_link(156, "merged")]})
     sync = KanbanSync(client)
     boards.shows["t_1"] = {"id": "t_1", "tenant": "ENG-1", "completed": True}
     boards.cards_by[(BOARD, "ENG-1")] = [card("t_1", "done", "coder", 1), card("t_2", "done", "reviewer", 2)]
@@ -510,7 +686,7 @@ async def test_a_merged_pr_lets_the_completed_card_set_reach_done(boards):
     assert client.updates == [{"id": "issue-ENG-1", "stateId": "s-done"}]
 
 
-async def test_an_attachment_fetch_failure_holds_done_in_reviewing_with_one_warning(boards, caplog):
+async def test_an_attachment_fetch_failure_holds_done_in_ready_to_merge_with_one_warning(boards, caplog):
     client = FakeClient(current={"ENG-1": "Working"}, fail_attachments=RuntimeError("attachments unavailable"))
     sync = KanbanSync(client)
     boards.shows["t_1"] = {"id": "t_1", "tenant": "ENG-1", "completed": True}
@@ -519,11 +695,105 @@ async def test_an_attachment_fetch_failure_holds_done_in_reviewing_with_one_warn
     with caplog.at_level(logging.INFO):
         await sync._handle_event(BOARD, event(1, "t_1", "completed"))
 
-    assert client.updates == [{"id": "issue-ENG-1", "stateId": "s-reviewing"}]
+    assert client.updates == [{"id": "issue-ENG-1", "stateId": "s-ready-to-merge"}]
     warnings = [record.getMessage() for record in caplog.records if record.levelno == logging.WARNING]
     assert warnings == [
-        f"warn: watch {BOARD} t_1: attachments unavailable, holding ENG-1 in Reviewing: attachments unavailable"
+        f"warn: watch {BOARD} t_1: attachments unavailable, holding ENG-1 in Ready to Merge: attachments unavailable"
     ]
+
+
+# -- parent rollup -------------------------------------------------------------
+
+
+def child_node(key: str, state_name: str) -> dict[str, Any]:
+    return {"id": f"issue-{key}", "identifier": key, "state": {"name": state_name}}
+
+
+async def test_a_blocked_child_rolls_the_parent_up_to_blocked(boards):
+    client = FakeClient(current={"ENG-2": "Working", "ENG-3": "Working"})
+    client.issue_states["issue-ENG-1"] = state("Working")
+    client.children["issue-ENG-1"] = [child_node("ENG-2", "Working"), child_node("ENG-3", "Working")]
+    client.parents["ENG-3"] = {"id": "issue-ENG-1", "identifier": "ENG-1"}
+    sync = KanbanSync(client)
+    boards.shows["t_3"] = {"id": "t_3", "tenant": "ENG-3", "completed": False}
+    boards.cards_by[(BOARD, "ENG-3")] = [card("t_3", "blocked", "coder")]
+
+    await sync._handle_event(BOARD, event(1, "t_3", "blocked"))
+
+    assert client.updates == [
+        {"id": "issue-ENG-3", "stateId": "s-blocked"},
+        {"id": "issue-ENG-1", "stateId": "s-blocked"},
+    ]
+
+
+async def test_a_working_child_rolls_the_parent_up_to_working(boards):
+    client = FakeClient(current={"ENG-3": "Todo"})
+    client.issue_states["issue-ENG-1"] = state("Blocked")
+    # the just-written child state is taken from the write, not from this read
+    client.children["issue-ENG-1"] = [child_node("ENG-2", "Done"), child_node("ENG-3", "Todo")]
+    client.parents["ENG-3"] = {"id": "issue-ENG-1", "identifier": "ENG-1"}
+    sync = KanbanSync(client)
+    boards.shows["t_3"] = {"id": "t_3", "tenant": "ENG-3", "completed": False}
+    boards.cards_by[(BOARD, "ENG-3")] = [card("t_3", "running", "coder")]
+
+    await sync._handle_event(BOARD, event(1, "t_3", "claimed"))
+
+    assert client.updates == [
+        {"id": "issue-ENG-3", "stateId": "s-working"},
+        {"id": "issue-ENG-1", "stateId": "s-working"},
+    ]
+
+
+async def test_a_parent_whose_children_are_all_done_is_left_alone(boards):
+    client = FakeClient(current={"ENG-3": "Todo"})
+    client.issue_states["issue-ENG-1"] = state("Working")
+    client.children["issue-ENG-1"] = [child_node("ENG-2", "Done"), child_node("ENG-3", "Todo")]
+    client.parents["ENG-3"] = {"id": "issue-ENG-1", "identifier": "ENG-1"}
+    sync = KanbanSync(client)
+    boards.shows["t_3"] = {"id": "t_3", "tenant": "ENG-3", "completed": True}
+    boards.cards_by[(BOARD, "ENG-3")] = [card("t_3", "done", "coder", 1)]
+
+    await sync._handle_event(BOARD, event(1, "t_3", "completed"))
+
+    assert client.updates == [{"id": "issue-ENG-3", "stateId": "s-done"}]
+
+
+async def test_a_parent_already_at_the_rollup_is_not_rewritten(boards):
+    client = FakeClient(current={"ENG-3": "Todo"})
+    client.issue_states["issue-ENG-1"] = state("Working")
+    client.children["issue-ENG-1"] = [child_node("ENG-2", "Working"), child_node("ENG-3", "Todo")]
+    client.parents["ENG-3"] = {"id": "issue-ENG-1", "identifier": "ENG-1"}
+    sync = KanbanSync(client)
+    boards.shows["t_3"] = {"id": "t_3", "tenant": "ENG-3", "completed": False}
+    boards.cards_by[(BOARD, "ENG-3")] = [card("t_3", "running", "coder")]
+
+    await sync._handle_event(BOARD, event(1, "t_3", "claimed"))
+
+    assert client.updates == [{"id": "issue-ENG-3", "stateId": "s-working"}]
+
+
+async def test_an_event_on_an_issue_with_children_writes_the_rollup_not_its_cards(boards):
+    client = FakeClient(current={"ENG-1": "Working"})
+    client.children["ENG-1"] = [child_node("ENG-2", "Working")]
+    sync = KanbanSync(client)
+    boards.shows["t_1"] = {"id": "t_1", "tenant": "ENG-1", "completed": False}
+    boards.cards_by[(BOARD, "ENG-1")] = [card("t_1", "review", "oracle")]
+
+    await sync._handle_event(BOARD, event(1, "t_1", "claimed"))
+
+    assert client.updates == []
+
+
+async def test_a_work_issue_without_a_parent_never_fetches_one(boards):
+    client = FakeClient(current={"ENG-3": "Todo"})
+    sync = KanbanSync(client)
+    boards.shows["t_3"] = {"id": "t_3", "tenant": "ENG-3", "completed": False}
+    boards.cards_by[(BOARD, "ENG-3")] = [card("t_3", "running", "coder")]
+
+    await sync._handle_event(BOARD, event(1, "t_3", "claimed"))
+
+    assert client.updates == [{"id": "issue-ENG-3", "stateId": "s-working"}]
+    assert [variables["id"] for variables in client.operations("Issue")] == ["ENG-3", "ENG-3"]
 
 
 # -- followers and cursors ----------------------------------------------------
@@ -547,8 +817,8 @@ async def test_a_saved_cursor_is_resumed_without_seeding(boards):
     assert boards.saved == []
 
 
-async def test_the_follower_saves_the_cursor_after_each_event(boards):
-    sync = KanbanSync(FakeClient(), poll_seconds=0.01)
+async def test_the_follower_reads_once_on_start_and_saves_the_cursor_after_each_event(boards, idle_watch):
+    sync = KanbanSync(FakeClient())
     boards.cursors[BOARD] = 0
     boards.shows["t_1"] = {"id": "t_1", "tenant": None, "completed": False}
     boards.events[BOARD] = [event(1, "t_1", "claimed"), event(2, "t_2", "heartbeat")]
@@ -563,8 +833,26 @@ async def test_the_follower_saves_the_cursor_after_each_event(boards):
     assert boards.saved == [(BOARD, 1), (BOARD, 2)]
 
 
+async def test_a_filesystem_change_reads_the_events_that_landed_after_the_start(boards, watch):
+    sync = KanbanSync(FakeClient())
+    boards.cursors[BOARD] = 0
+    boards.shows["t_1"] = {"id": "t_1", "tenant": None, "completed": False}
+
+    task = asyncio.create_task(sync._follow_forever(BOARD, f"/tmp/{BOARD}.db"))
+    try:
+        await until(lambda: bool(watch.queues))
+        boards.events[BOARD] = [event(1, "t_1", "claimed")]
+        watch.yield_change()
+        await until(lambda: boards.cursors.get(BOARD) == 1)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert boards.saved == [(BOARD, 1)]
+
+
 async def test_a_failing_event_logs_and_the_follower_keeps_going(boards, caplog, monkeypatch):
-    sync = KanbanSync(FakeClient(), poll_seconds=0.01)
+    sync = KanbanSync(FakeClient())
     boards.cursors[BOARD] = 0
     boards.events[BOARD] = [event(1, "t_boom", "claimed"), event(2, "t_ok", "claimed")]
     original_show = boards.show
@@ -589,8 +877,42 @@ async def test_a_failing_event_logs_and_the_follower_keeps_going(boards, caplog,
     assert boards.cursors[BOARD] == 2
 
 
-async def test_board_discovery_starts_exactly_one_follower_per_new_slug(boards):
-    sync = KanbanSync(FakeClient(), poll_seconds=0.01)
+async def test_a_vanished_db_stops_the_follower_with_no_error_log(boards, caplog, monkeypatch):
+    sync = KanbanSync(FakeClient())
+    boards.cursors[BOARD] = 5
+
+    def gone(db_path: str, after: int, limit: int = 200) -> list[dict[str, Any]]:
+        raise FileNotFoundError(db_path)
+
+    monkeypatch.setattr(kanban_cli, "read_events", gone)
+
+    with caplog.at_level(logging.DEBUG):
+        await asyncio.wait_for(sync._follow_forever(BOARD, f"/tmp/{BOARD}.db"), timeout=2)
+
+    assert [record for record in caplog.records if record.levelno >= logging.ERROR] == []
+
+
+async def test_a_read_failure_logs_one_line_and_never_retries(boards, caplog, monkeypatch):
+    sync = KanbanSync(FakeClient())
+    boards.cursors[BOARD] = 5
+    calls: list[str] = []
+
+    def locked(db_path: str, after: int, limit: int = 200) -> list[dict[str, Any]]:
+        calls.append(db_path)
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(kanban_cli, "read_events", locked)
+
+    with caplog.at_level(logging.ERROR):
+        await asyncio.wait_for(sync._follow_forever(BOARD, f"/tmp/{BOARD}.db"), timeout=2)
+
+    assert calls == [f"/tmp/{BOARD}.db"]
+    errors = [record.getMessage() for record in caplog.records if record.levelno == logging.ERROR]
+    assert errors == [f"error: watch {BOARD}: database is locked"]
+
+
+async def test_board_discovery_starts_one_follower_per_new_slug_and_cancels_the_rest(boards, idle_watch):
+    sync = KanbanSync(FakeClient())
     boards.slugs = ["a"]
     boards.cursors["a"] = 0
 
@@ -599,34 +921,54 @@ async def test_board_discovery_starts_exactly_one_follower_per_new_slug(boards):
     boards.cursors["b"] = 0
     assert await sync._poll_boards() == ["b"]
     assert await sync._poll_boards() == []
-    assert [task for task in sync._followers if not task.done()]
+    assert set(sync._followers) == {"a", "b"}
 
-    for task in sync._followers:
-        task.cancel()
-    await asyncio.gather(*sync._followers, return_exceptions=True)
+    boards.slugs = ["a"]
+    assert await sync._poll_boards() == []
+    assert set(sync._followers) == {"a"}
+
+    followers = list(sync._followers.values())
+    for follower in followers:
+        follower.cancel()
+    await asyncio.gather(*followers, return_exceptions=True)
 
 
-async def test_start_returns_the_discovery_and_reconcile_tasks(boards):
-    sync = KanbanSync(FakeClient(), discovery_seconds=60, reconcile_seconds=60, poll_seconds=0.01)
+async def test_an_archived_board_is_never_followed(boards, idle_watch):
+    sync = KanbanSync(FakeClient())
+    boards.slugs = ["a", "b"]
+    boards.archived = {"b"}
+
+    assert await sync._poll_boards() == ["a"]
+    assert set(sync._followers) == {"a"}
+
+    followers = list(sync._followers.values())
+    for follower in followers:
+        follower.cancel()
+    await asyncio.gather(*followers, return_exceptions=True)
+
+
+async def test_start_returns_the_discovery_and_reconcile_tasks(boards, idle_watch, tmp_path):
+    sync = KanbanSync(FakeClient(), boards_root=tmp_path / "boards", reconcile_seconds=60)
     boards.cursors[BOARD] = 0
 
     tasks = sync.start()
     try:
-        await until(lambda: BOARD in sync._started_boards)
+        await until(lambda: BOARD in sync._followers)
         assert len(tasks) == 2
     finally:
-        for task in [*tasks, *sync._followers]:
+        followers = list(sync._followers.values())
+        for task in [*tasks, *followers]:
             task.cancel()
-        await asyncio.gather(*tasks, *sync._followers, return_exceptions=True)
+        await asyncio.gather(*tasks, *followers, return_exceptions=True)
 
 
-async def test_cancelling_the_discovery_task_cancels_its_followers(boards):
-    sync = KanbanSync(FakeClient(), discovery_seconds=60, reconcile_seconds=60, poll_seconds=0.01)
+async def test_cancelling_the_discovery_task_cancels_its_followers(boards, idle_watch, tmp_path):
+    sync = KanbanSync(FakeClient(), boards_root=tmp_path / "boards", reconcile_seconds=60)
     boards.cursors[BOARD] = 0
 
     discovery, reconcile = sync.start()
-    await until(lambda: BOARD in sync._started_boards)
-    followers = list(sync._followers)
+    await until(lambda: BOARD in sync._followers)
+    followers = list(sync._followers.values())
     assert followers
     discovery.cancel()
     reconcile.cancel()
@@ -635,36 +977,89 @@ async def test_cancelling_the_discovery_task_cancels_its_followers(boards):
     assert all(task.done() for task in followers)
 
 
-async def test_a_follower_retry_resumes_from_the_saved_cursor_not_the_seed(boards, monkeypatch):
-    sync = KanbanSync(FakeClient(), poll_seconds=0.01)
-    boards.events[BOARD] = [event(5, "t_1", "heartbeat")]
-    calls = {"n": 0}
-    real = boards.read_events
+# -- real filesystem watches ---------------------------------------------------
 
-    def flaky(db_path, after, limit=200):
-        calls["n"] += 1
-        if calls["n"] == 2:
-            raise RuntimeError("database is locked")
-        return real(db_path, after, limit)
 
-    monkeypatch.setattr(kanban_cli, "read_events", flaky)
-    boards.cursors[BOARD] = 0
-    task = asyncio.create_task(sync._follow_forever(BOARD, f"/tmp/{BOARD}.db"))
+def make_board_db(path: Path) -> None:
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        "CREATE TABLE tasks (id TEXT PRIMARY KEY, assignee TEXT, tenant TEXT);"
+        "CREATE TABLE task_events (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, kind TEXT, payload TEXT);"
+    )
+    conn.commit()
+    conn.close()
+
+
+def add_board_event(path: Path, task_id: str = "t_1", kind: str = "claimed") -> None:
+    conn = sqlite3.connect(path)
+    conn.execute("INSERT INTO task_events (task_id, kind, payload) VALUES (?, ?, '{}')", (task_id, kind))
+    conn.commit()
+    conn.close()
+
+
+async def test_a_board_recreated_under_the_same_slug_receives_its_first_event(cli, watching, state_dir, tmp_path):
+    root = tmp_path / "boards"
+    folder = root / "eng"
+    folder.mkdir(parents=True)
+    db = folder / "kanban.db"
+    make_board_db(db)
+    kanban_cli.save_cursor("eng", str(db), 5)  # the first incarnation's cursor
+
+    # the board is removed and re-created under the same slug: a new inode
+    db.unlink()
+    make_board_db(db)
+    assert kanban_cli.load_cursor("eng", str(db)) is None, "a new inode starts from scratch"
+    cli.paths["eng"] = str(db)
+
+    sync = KanbanSync(FakeClient(), boards_root=root)
+    task = asyncio.create_task(sync._follow_forever("eng", str(db)))
     try:
-        await until(lambda: calls["n"] >= 4)
+        await asyncio.wait_for(watching.wait(), timeout=2)
+        await until(lambda: kanban_cli.load_cursor("eng", str(db)) == 0)
+        add_board_event(db)
+        await until(lambda: kanban_cli.load_cursor("eng", str(db)) == 1)
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
 
-    assert boards.cursors[BOARD] == 5
-    assert boards.saved == [(BOARD, 5)]
+    assert kanban_cli.load_cursor("eng", str(db)) == 1
+
+
+async def test_a_removed_board_follower_exits_with_no_error_log(cli, watching, state_dir, tmp_path, caplog):
+    root = tmp_path / "boards"
+    folder = root / "eng"
+    folder.mkdir(parents=True)
+    db = folder / "kanban.db"
+    make_board_db(db)
+    cli.paths["eng"] = str(db)
+
+    sync = KanbanSync(FakeClient(), boards_root=root)
+    with caplog.at_level(logging.DEBUG):
+        task = asyncio.create_task(sync._follow_forever("eng", str(db)))
+        try:
+            await asyncio.wait_for(watching.wait(), timeout=2)
+            await until(lambda: kanban_cli.load_cursor("eng", str(db)) == 0)
+            shutil.rmtree(folder)
+            await asyncio.wait_for(task, timeout=5)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    assert task.done()
+    assert [record for record in caplog.records if record.levelno >= logging.ERROR] == []
 
 
 # -- reconcile ----------------------------------------------------------------
 
 
-def active_issue(key: str, state_name: str, attachments: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-    return {
+def active_issue(
+    key: str,
+    state_name: str,
+    attachments: list[dict[str, Any]] | None = None,
+    children: list[dict[str, Any]] | None = None,
+    parent: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    node: dict[str, Any] = {
         "id": f"issue-{key}",
         "identifier": key,
         "title": f"Issue {key}",
@@ -674,6 +1069,11 @@ def active_issue(key: str, state_name: str, attachments: list[dict[str, Any]] | 
         "team": {"id": "team-eng", "key": "ENG"},
         "attachments": {"nodes": attachments or []},
     }
+    if children is not None:
+        node["children"] = {"nodes": children}
+    if parent is not None:
+        node["parent"] = parent
+    return node
 
 
 def page(nodes: list[dict[str, Any]], has_next: bool = False, cursor: str | None = None) -> dict[str, Any]:
@@ -696,6 +1096,24 @@ async def test_active_issues_follows_every_page_and_passes_string_literals(board
     assert client.operations("ActiveIssues")[0]["team"] == "ENG"
     assert 'in: ["backlog", "unstarted", "started"]' in client.calls[0][0]
     assert "attachments(first: 10) { nodes { url sourceType metadata } }" in client.calls[0][0]
+    assert "parent { id identifier }" in client.calls[0][0]
+    assert "children { nodes { id identifier state { name } } }" in client.calls[0][0]
+
+
+async def test_active_issues_flattens_the_parent_and_children(boards):
+    node = active_issue(
+        "ENG-1",
+        "Working",
+        children=[child_node("ENG-2", "Done")],
+        parent={"id": "issue-ENG-9", "identifier": "ENG-9"},
+    )
+    client = FakeClient(active_pages={None: page([node])})
+    sync = KanbanSync(client)
+
+    found = await sync._active_issues()
+
+    assert found[0]["parent"] == {"id": "issue-ENG-9", "identifier": "ENG-9"}
+    assert found[0]["children"] == [{"id": "issue-ENG-2", "identifier": "ENG-2", "state": {"name": "Done"}}]
 
 
 async def test_reconcile_leaves_an_issue_with_no_cards_alone(boards):
@@ -709,7 +1127,7 @@ async def test_reconcile_leaves_an_issue_with_no_cards_alone(boards):
 async def test_reconcile_fixes_a_stale_status_then_is_silent_once_it_matches(boards, caplog):
     client = FakeClient(active_pages={None: page([active_issue("ENG-14", "Working")])})
     sync = KanbanSync(client)
-    boards.cards_by[(BOARD, "ENG-14")] = [card("t_review", "review", "reviewer")]
+    boards.cards_by[(BOARD, "ENG-14")] = [card("t_review", "review", "oracle")]
 
     with caplog.at_level(logging.INFO):
         assert await sync.reconcile() == 1
@@ -740,7 +1158,7 @@ async def test_reconcile_holds_done_for_an_open_pr(boards):
     boards.cards_by[(BOARD, "ENG-18")] = [card("t_a", "done", "coder", 1), card("t_b", "done", "reviewer", 2)]
 
     assert await sync.reconcile() == 1
-    assert client.updates == [{"id": "issue-ENG-18", "stateId": "s-reviewing"}]
+    assert client.updates == [{"id": "issue-ENG-18", "stateId": "s-ready-to-merge"}]
 
 
 async def test_reconcile_writes_done_with_no_pr(boards):
@@ -750,6 +1168,38 @@ async def test_reconcile_writes_done_with_no_pr(boards):
 
     assert await sync.reconcile() == 1
     assert client.updates == [{"id": "issue-ENG-20", "stateId": "s-done"}]
+
+
+async def test_reconcile_rolls_a_parent_up_from_its_children(boards):
+    node = active_issue(
+        "ENG-1",
+        "Working",
+        children=[child_node("ENG-2", "Blocked"), child_node("ENG-3", "Working")],
+    )
+    client = FakeClient(active_pages={None: page([node])})
+    sync = KanbanSync(client)
+
+    assert await sync.reconcile() == 1
+    assert client.updates == [{"id": "issue-ENG-1", "stateId": "s-blocked"}]
+
+
+async def test_reconcile_prefers_the_rollup_over_a_parent_s_own_cards(boards):
+    node = active_issue("ENG-1", "Todo", children=[child_node("ENG-2", "Done")])
+    client = FakeClient(active_pages={None: page([node])})
+    sync = KanbanSync(client)
+    boards.cards_by[(BOARD, "ENG-1")] = [card("t_a", "running", "coder")]
+
+    assert await sync.reconcile() == 0
+    assert client.updates == []
+
+
+async def test_reconcile_leaves_a_parent_whose_children_are_all_done(boards):
+    node = active_issue("ENG-1", "Working", children=[child_node("ENG-2", "Done"), child_node("ENG-3", "Canceled")])
+    client = FakeClient(active_pages={None: page([node])})
+    sync = KanbanSync(client)
+
+    assert await sync.reconcile() == 0
+    assert client.updates == []
 
 
 async def test_reconcile_loads_a_team_s_states_at_most_once_per_pass(boards):
@@ -771,7 +1221,7 @@ async def test_reconcile_concatenates_cards_across_every_board(boards):
     sync = KanbanSync(client)
     boards.slugs = ["board-a", "board-b"]
     boards.cards_by[("board-a", "ENG-40")] = [card("t_a", "done", "coder", 1)]
-    boards.cards_by[("board-b", "ENG-40")] = [card("t_b", "ready", "coder")]
+    boards.cards_by[("board-b", "ENG-40")] = [card("t_b", "running", "coder")]
 
     assert await sync.reconcile() == 0
     assert client.updates == []

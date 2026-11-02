@@ -1,9 +1,10 @@
 """Pure status rules for the kanban <-> Linear bridge.
 
 Ported case-for-case from peak-agent-tools' TypeScript suites:
-``issuesync.test.ts`` (transition table, closed types, open cards),
-``blocked.test.ts`` (withBlocked), and ``watch.test.ts`` (issueStatus,
-prGate). The tables are the specification; keep them in sync with the TS.
+``issuesync.test.ts`` (transition table, closed types, open cards) and
+``watch.test.ts`` (issueStatus, prGate), plus the ENG-2286 8-row
+``issueStatus`` precedence and the parent-session ``rollup``. The tables are
+the specification; keep them in sync.
 """
 
 from __future__ import annotations
@@ -15,13 +16,14 @@ import pytest
 from hermes_linear_agent.kanban_rules import (
     ACTED,
     CLOSED_TYPES,
+    STATE_IDS,
     Card,
     is_completed,
     is_open,
     issue_status,
     pr_gate,
+    rollup,
     transition,
-    with_blocked,
 )
 
 
@@ -200,123 +202,95 @@ def test_pr_gate_reads_open_merged_and_none_from_attachments(links, expected):
 
 
 # ---------------------------------------------------------------------------
-# with_blocked (blocked.ts:10-12, blocked.test.ts)
+# STATE_IDS (ENG-2286)
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("cards", "status", "expected"),
-    [
-        pytest.param([card("t_a", "blocked"), card("t_b", "running")], "Working", "Blocked", id="one-blocked-wins"),
-        pytest.param([card("t_a", "blocked")], "Blocked", "Blocked", id="already-blocked"),
-        pytest.param(
-            [card("t_a", "blocked"), card("t_b", "todo")], "Reviewing", "Blocked", id="blocked-beats-reviewing"
-        ),
-        pytest.param([card("t_a", "running")], "Working", "Working", id="no-blocked-card"),
-        pytest.param([], None, None, id="no-cards-keeps-null"),
-        pytest.param([], "Done", "Done", id="no-cards-keeps-given-status"),
-        pytest.param([card("t_a", "done")], "Working", "Working", id="done-is-not-a-block"),
-        pytest.param([card("t_a", "archived")], "Canceled", "Canceled", id="archived-is-not-a-block"),
-    ],
-)
-def test_with_blocked_reads_blocked_from_any_blocked_card_and_only_then(cards, status, expected):
-    assert with_blocked(cards, status) == expected
+def test_state_ids_are_the_eng_team_workflow_state_ids():
+    assert STATE_IDS == {
+        "Blocked": "8de0dfd6-614f-4d0d-9ee1-aee47a12bb58",
+        "Working": "f41a9dcb-10c9-41d9-a7cf-e83f0e49367a",
+        "Reviewing": "916a7971-5640-4989-a7ae-d8175499851f",
+        "Ready to Merge": "40c4ac3a-e45a-4817-a19b-7b94eb1bb0ed",
+        "Todo": "bb1c80eb-1a31-4616-9033-602a12b82ba0",
+        "Done": "975dfb59-166d-4df4-b70c-5382442448d8",
+        "Canceled": "7fc0e9b4-2d39-45dc-87aa-79a8d9c5ce5c",
+    }
 
 
 # ---------------------------------------------------------------------------
-# issue_status (watch.ts:118-146, watch.test.ts)
+# issue_status (ENG-2286: 8-row precedence, first match wins)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
     ("cards", "expected"),
     [
-        pytest.param([], None, id="no-cards"),
-        pytest.param([card("t_a", "todo", "coder")], "Working", id="one-open-card"),
-        pytest.param([card("t_a", "done", "coder", 1), card("t_b", "done", "coder", 2)], "Done", id="everything-done"),
+        # row 1: any blocked card wins over everything
+        pytest.param([card("t_a", "blocked")], "Blocked", id="row1-one-blocked"),
+        pytest.param([card("t_a", "blocked"), card("t_b", "running")], "Blocked", id="row1-blocked-beats-running"),
+        pytest.param([card("t_a", "blocked"), card("t_b", "todo")], "Blocked", id="row1-blocked-beats-todo"),
+        pytest.param([card("t_a", "blocked"), card("t_b", "review")], "Blocked", id="row1-blocked-beats-review"),
+        # row 2: any running card wins over review and everything below
+        pytest.param([card("t_a", "running")], "Working", id="row2-one-running"),
+        pytest.param([card("t_a", "running"), card("t_b", "review")], "Working", id="row2-running-beats-review"),
+        pytest.param([card("t_a", "running"), card("t_b", "todo")], "Working", id="row2-running-beats-todo"),
+        pytest.param([card("t_a", "running", completed_at=3)], "Working", id="row2-running-beats-completed-at"),
+        # row 3: any review card
+        pytest.param([card("t_a", "review")], "Reviewing", id="row3-one-review"),
+        pytest.param([card("t_a", "review"), card("t_b", "todo")], "Reviewing", id="row3-review-beats-todo"),
+        pytest.param([card("t_a", "review"), card("t_b", "ready")], "Reviewing", id="row3-review-beats-ready"),
+        # row 4: every open card is todo/ready/triage
+        pytest.param([card("t_a", "todo")], "Todo", id="row4-one-todo"),
+        pytest.param([card("t_a", "ready")], "Todo", id="row4-one-ready"),
+        pytest.param([card("t_a", "triage")], "Todo", id="row4-one-triage"),
         pytest.param(
-            [card("t_a", "done", "coder"), card("t_b", "running", "coder", 3)],
+            [card("t_a", "done", completed_at=1), card("t_b", "todo")], "Todo", id="row4-done-plus-todo-is-todo"
+        ),
+        pytest.param(
+            [card("t_a", "done", completed_at=1), card("t_b", "todo"), card("t_c", "ready")],
+            "Todo",
+            id="row4-done-plus-todo-and-ready-is-todo",
+        ),
+        # row 5: every card completed, PR still open
+        pytest.param(
+            [card("t_a", "done", completed_at=1), card("t_b", "done", completed_at=2)],
+            "Ready to Merge",
+            id="row5-done-set-with-open-pr",
+        ),
+        # row 6: every card completed, PR merged or none
+        pytest.param(
+            [card("t_a", "done", completed_at=1), card("t_b", "done", completed_at=2)],
             "Done",
-            id="done-by-completed_at-even-when-the-status-lags",
+            id="row6-done-set-with-no-pr",
         ),
         pytest.param(
-            [card("t_a", "done", "coder", 1), card("t_b", "archived", "coder", 2)],
+            [card("t_a", "done", completed_at=1), card("t_b", "archived")],
             "Done",
-            id="mixed-done-plus-archived-completed-is-done",
+            id="row6-done-plus-archived-never-completed-is-done",
         ),
         pytest.param(
-            [card("t_a", "done", "coder", 1), card("t_b", "archived", "coder")],
+            [card("t_a", "done", completed_at=1), card("t_b", "archived", completed_at=2)],
             "Done",
-            id="one-completed-plus-archived-never-completed-is-done",
+            id="row6-done-plus-archived-completed-is-done",
         ),
-        pytest.param([card("t_a", "archived", "coder")], "Canceled", id="single-archived-not-completed"),
+        # row 7: every card archived and none completed
+        pytest.param([card("t_a", "archived")], "Canceled", id="row7-one-archived-never-completed"),
         pytest.param(
-            [
-                card("t_a", "done", "coder", 1),
-                card("t_b", "todo", "reviewer"),
-                card("t_c", "ready", "reviewer"),
-            ],
-            "Reviewing",
-            id="every-open-card-is-the-reviewers",
-        ),
-        pytest.param(
-            [card("t_a", "todo", "reviewer"), card("t_b", "ready", "coder")],
-            "Working",
-            id="one-open-coder-among-reviewers-is-working",
-        ),
-        pytest.param([card("t_a", "ready")], "Working", id="open-card-with-no-assignee-is-working"),
-        pytest.param(
-            [card("t_a", "archived"), card("t_b", "running", "coder")],
-            "Working",
-            id="archived-card-does-not-stop-open-work",
-        ),
-    ],
-)
-def test_issue_status_follows_the_status_rule_for_the_whole_card_set(cards, expected):
-    assert issue_status(cards) == expected
-
-
-@pytest.mark.parametrize(
-    ("cards", "expected"),
-    [
-        pytest.param([], None, id="no-cards-at-all"),
-        pytest.param([card("t_a", "archived", "orchestrator")], "Canceled", id="one-archived-never-completed"),
-        pytest.param(
-            [card("t_a", "archived", "orchestrator"), card("t_b", "archived", "orchestrator")],
+            [card("t_a", "archived"), card("t_b", "archived")],
             "Canceled",
-            id="two-archived-never-completed",
+            id="row7-two-archived-never-completed",
         ),
-        pytest.param([card("t_a", "done", "coder", 1)], "Done", id="one-completed"),
-        pytest.param([card("t_a", "done", "coder", 1), card("t_b", "done", "coder", 2)], "Done", id="two-completed"),
-        pytest.param(
-            [card("t_a", "done", "coder", 1), card("t_b", "archived", "orchestrator")],
-            "Done",
-            id="completed-then-archived-never-completed",
-        ),
-        pytest.param(
-            [card("t_a", "archived", "orchestrator"), card("t_b", "done", "coder", 1)],
-            "Done",
-            id="archived-never-completed-then-completed",
-        ),
-        pytest.param([card("t_a", "todo", "reviewer")], "Reviewing", id="open-reviewer-card-only"),
-        pytest.param(
-            [
-                card("t_a", "done", "coder", 1),
-                card("t_b", "archived", "orchestrator"),
-                card("t_c", "ready", "reviewer"),
-            ],
-            "Reviewing",
-            id="open-reviewer-beside-archived-and-completed",
-        ),
-        pytest.param(
-            [card("t_a", "archived", "orchestrator"), card("t_b", "running", "coder")],
-            "Working",
-            id="open-coder-beside-archived-dead-is-working-never-canceled",
-        ),
+        # row 8: no cards
+        pytest.param([], None, id="row8-no-cards"),
+        # leftover: an open card that is none of the above behaves as work
+        pytest.param([card("t_a", "weird")], "Working", id="unknown-open-status-is-working"),
+        pytest.param([card("t_a", "archived"), card("t_b", "running")], "Working", id="archived-beside-running"),
     ],
 )
-def test_issue_status_is_canceled_only_when_every_card_is_archived_and_uncompleted(cards, expected):
-    assert issue_status(cards) == expected
+def test_issue_status_follows_the_eight_row_precedence(cards, expected):
+    attachments = [pr_link(156, "open")] if expected == "Ready to Merge" else None
+    assert issue_status(cards, attachments) == expected
 
 
 @pytest.mark.parametrize(
@@ -324,21 +298,56 @@ def test_issue_status_is_canceled_only_when_every_card_is_archived_and_uncomplet
     [
         pytest.param([], "Done", id="completed-set-with-no-pr"),
         pytest.param([REPO_LINK], "Done", id="completed-set-with-only-a-repo-link"),
-        pytest.param([REPO_LINK, pr_link(156, "open")], "Reviewing", id="completed-set-with-an-open-pr"),
+        pytest.param([REPO_LINK, pr_link(156, "open")], "Ready to Merge", id="completed-set-with-an-open-pr"),
         pytest.param([pr_link(156, "merged")], "Done", id="completed-set-with-a-merged-pr"),
-        pytest.param([pr_link(1, "merged"), pr_link(2, "open")], "Reviewing", id="one-open-pr-holds-reviewing"),
+        pytest.param([pr_link(1, "merged"), pr_link(2, "open")], "Ready to Merge", id="one-open-pr-holds-ready"),
+        pytest.param(
+            [pr_link(1, "merged")],
+            "Done",
+            id="done-plus-archived-with-merged-pr-is-done",
+        ),
     ],
 )
-def test_a_completed_card_set_reaches_done_only_when_no_pr_is_open(links, expected):
-    done_set = [card("t_a", "done", "coder", 1), card("t_b", "done", "reviewer", 2)]
+def test_a_completed_card_set_is_ready_to_merge_only_when_no_pr_is_merged(links, expected):
+    done_set = [card("t_a", "done", completed_at=1), card("t_b", "done", completed_at=2)]
+    if links == [pr_link(1, "merged")]:
+        done_set = [card("t_a", "done", completed_at=1), card("t_b", "archived")]
     assert issue_status(done_set, links) == expected
 
 
 def test_attachments_default_to_none_and_never_gate_a_non_done_status():
-    assert issue_status([card("t_a", "running", "coder")]) == "Working"
-    assert issue_status([card("t_a", "running", "coder")], None) == "Working"
-    # an open PR beside open work still means Working, not Reviewing
-    assert issue_status([card("t_a", "running", "coder")], [pr_link(1, "open")]) == "Working"
+    assert issue_status([card("t_a", "running")]) == "Working"
+    assert issue_status([card("t_a", "running")], None) == "Working"
+    # an open PR beside open work still means Working, not Ready to Merge
+    assert issue_status([card("t_a", "running")], [pr_link(1, "open")]) == "Working"
+
+
+# ---------------------------------------------------------------------------
+# rollup (ENG-2286: parent card status from its child cards)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("child_states", "expected"),
+    [
+        pytest.param(["Blocked"], "Blocked", id="one-blocked"),
+        pytest.param(["Working", "Blocked"], "Blocked", id="blocked-beats-working"),
+        pytest.param(["Done", "Blocked"], "Blocked", id="blocked-beats-done"),
+        pytest.param(["Working"], "Working", id="one-working"),
+        pytest.param(["Reviewing"], "Working", id="reviewing-rolls-up-to-working"),
+        pytest.param(["Ready to Merge"], "Working", id="ready-to-merge-rolls-up-to-working"),
+        pytest.param(["Done", "Reviewing"], "Working", id="one-started-among-done"),
+        pytest.param(["Done"], None, id="all-done"),
+        pytest.param(["Done", "Canceled"], None, id="done-and-canceled"),
+        pytest.param(["Canceled"], None, id="all-canceled"),
+        pytest.param([], None, id="empty"),
+        pytest.param(["Todo"], None, id="todo-only"),
+        pytest.param(["Backlog"], None, id="backlog-only"),
+        pytest.param(["Todo", "Backlog"], None, id="todo-and-backlog-only"),
+    ],
+)
+def test_rollup_reads_blocked_then_working_and_otherwise_leaves_the_parent_alone(child_states, expected):
+    assert rollup(child_states) == expected
 
 
 def test_cards_are_frozen():
