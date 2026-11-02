@@ -21,16 +21,24 @@ _CANCEL_TYPES: frozenset[str] = frozenset({"canceled", "duplicate"})
 #: The workflow state a blocked card puts its issue in.
 BLOCKED_STATE = "Blocked"
 
-#: ENG team Linear workflow state ids, by state name (ENG-2286).
-STATE_IDS: dict[str, str] = {
-    "Blocked": "8de0dfd6-614f-4d0d-9ee1-aee47a12bb58",
-    "Working": "f41a9dcb-10c9-41d9-a7cf-e83f0e49367a",
-    "Reviewing": "916a7971-5640-4989-a7ae-d8175499851f",
-    "Ready to Merge": "40c4ac3a-e45a-4817-a19b-7b94eb1bb0ed",
-    "Todo": "bb1c80eb-1a31-4616-9033-602a12b82ba0",
-    "Done": "975dfb59-166d-4df4-b70c-5382442448d8",
-    "Canceled": "7fc0e9b4-2d39-45dc-87aa-79a8d9c5ce5c",
+#: Per-team renames of the canonical (ENG) status names; a team not listed uses them as-is.
+TEAM_STATE_NAMES: dict[str, dict[str, str]] = {
+    "OPS": {"Working": "In Progress", "Reviewing": "In Review", "Ready to Merge": "In Review"},
 }
+
+#: States a human sets by hand; the sync never moves an issue out of them.
+HAND_STATES: dict[str, frozenset[str]] = {"OPS": frozenset({"Waiting on client"})}
+
+
+def team_state_name(team_key: str | None, status: str) -> str:
+    """The team's name for a canonical status."""
+    return TEAM_STATE_NAMES.get(team_key or "", {}).get(status, status)
+
+
+def hand_set(team_key: str | None, state_name: str | None) -> bool:
+    """True when ``state_name`` is one a human sets by hand for this team."""
+    return state_name in HAND_STATES.get(team_key or "", frozenset())
+
 
 #: Card statuses that mean the card can no longer change (D3).
 _CARD_CLOSED_STATUSES: frozenset[str] = frozenset({"done", "archived"})
@@ -39,7 +47,7 @@ _CARD_CLOSED_STATUSES: frozenset[str] = frozenset({"done", "archived"})
 _TODO_STATUSES: frozenset[str] = frozenset({"todo", "ready", "triage"})
 
 #: Child states that mean work has started, for rollup.
-_STARTED_STATES: frozenset[str] = frozenset({"Working", "Reviewing", "Ready to Merge"})
+_STARTED_STATES: frozenset[str] = frozenset({"Working", "Reviewing", "Ready to Merge", "In Progress", "In Review"})
 
 #: Every kanban event this bridge acts on (watch.ts:54-68). Anything else —
 #: heartbeat, worker_bound, dependency_wait, ... — never reaches Linear.

@@ -37,15 +37,32 @@ STATES: list[tuple[str, str, str]] = [
     ("Canceled", "s-canceled", "canceled"),
     ("Duplicate", "s-duplicate", "duplicate"),
 ]
+OPS_STATES: list[tuple[str, str, str]] = [
+    ("Triage", "o-triage", "triage"),
+    ("Backlog", "o-backlog", "backlog"),
+    ("Todo", "o-todo", "unstarted"),
+    ("In Progress", "o-in-progress", "started"),
+    ("In Review", "o-in-review", "started"),
+    ("Blocked", "o-blocked", "started"),
+    ("Waiting on client", "o-waiting", "started"),
+    ("Done", "o-done", "completed"),
+    ("Canceled", "o-canceled", "canceled"),
+    ("Duplicate", "o-duplicate", "duplicate"),
+]
 STATE_ID = {name: state_id for name, state_id, _type in STATES}
-STATE_TYPE = {state_id: state_type for _name, state_id, state_type in STATES}
+STATE_TYPE = {state_id: state_type for _name, state_id, state_type in STATES + OPS_STATES}
 
 
-def state(name: str) -> dict[str, str]:
-    for found, state_id, state_type in STATES:
+def state(name: str, team: str = "ENG") -> dict[str, str]:
+    for found, state_id, state_type in OPS_STATES if team == "OPS" else STATES:
         if found == name:
             return {"id": state_id, "name": name, "type": state_type}
     raise AssertionError(f"no test state {name}")
+
+
+def team_of(identifier: str) -> dict[str, str]:
+    key = "OPS" if identifier.startswith("OPS-") else "ENG"
+    return {"id": f"team-{key.lower()}", "key": key}
 
 
 def card(card_id: str, status: str, assignee: str | None = None, completed_at: int | None = None) -> Card:
@@ -87,8 +104,11 @@ class FakeClient:
         issue_states: dict[str, dict[str, str]] | None = None,
         parents: dict[str, dict[str, str]] | None = None,
         children: dict[str, list[dict[str, Any]]] | None = None,
+        ops_pages: dict[str | None, dict[str, Any]] | None = None,
     ) -> None:
-        self.current = {key: state(name) for key, name in (current or {}).items()}
+        self.current = {key: state(name, team_of(key)["key"]) for key, name in (current or {}).items()}
+        # ActiveIssues pages for the OPS team; `active_pages` answers ENG
+        self.ops_pages = ops_pages or {}
         self.states = states if states is not None else STATES
         self.attachments = attachments or {}
         self.fail_attachments = fail_attachments
@@ -131,20 +151,22 @@ class FakeClient:
             return {"issue": {"attachments": {"nodes": self.attachments.get(str(variables["id"]), [])}}}
 
         if query.startswith("query TeamStates("):
-            nodes = [{"id": state_id, "name": name, "type": state_type} for name, state_id, state_type in self.states]
+            states = OPS_STATES if variables.get("teamId") == "team-ops" else self.states
+            nodes = [{"id": state_id, "name": name, "type": state_type} for name, state_id, state_type in states]
             return {"team": {"states": {"nodes": nodes}}}
 
         if query.startswith("query Issue("):
             key = str(variables["id"])
             issue_id = key if key.startswith("issue-") else f"issue-{key}"
             identifier = key.removeprefix("issue-") if key.startswith("issue-") else key
-            node = self.current.get(identifier) or self.issue_states.get(issue_id) or state("Todo")
+            team = team_of(identifier)
+            node = self.current.get(identifier) or self.issue_states.get(issue_id) or state("Todo", team["key"])
             return {
                 "issue": {
                     "id": issue_id,
                     "identifier": identifier,
                     "state": node,
-                    "team": {"id": "team-eng", "key": "ENG"},
+                    "team": team,
                     "parent": self.parents.get(identifier) or self.parents.get(issue_id),
                     "children": {"nodes": self.children.get(issue_id) or self.children.get(identifier) or []},
                 }
@@ -158,7 +180,7 @@ class FakeClient:
             self.updates.append({"id": issue_id, "stateId": state_id})
             key = self._issue_key(issue_id)
             if key is not None:
-                for name, sid, state_type in self.states:
+                for name, sid, state_type in self.states + OPS_STATES:
                     if sid == state_id:
                         self.current[key] = {"id": sid, "name": name, "type": state_type}
                         break
@@ -173,7 +195,8 @@ class FakeClient:
                     await asyncio.sleep(self.delay)
                 if self.fail_active is not None:
                     raise self.fail_active
-                page = self.active_pages.get(variables.get("after"), EMPTY_PAGE)
+                pages = self.ops_pages if variables.get("team") == "OPS" else self.active_pages
+                page = pages.get(variables.get("after"), EMPTY_PAGE)
                 return {"issues": page}
             finally:
                 self._in_flight -= 1
@@ -1091,8 +1114,8 @@ def active_issue(
         "title": f"Issue {key}",
         "description": "Body",
         "url": f"https://linear.app/peak/issue/{key}",
-        "state": state(state_name),
-        "team": {"id": "team-eng", "key": "ENG"},
+        "state": state(state_name, team_of(key)["key"]),
+        "team": team_of(key),
         "attachments": {"nodes": attachments or []},
     }
     if children is not None:
@@ -1113,7 +1136,7 @@ async def test_active_issues_follows_every_page_and_passes_string_literals(board
             "cursor-1": page([active_issue("ENG-3", "Todo")]),
         }
     )
-    sync = KanbanSync(client)
+    sync = KanbanSync(client, team_keys=("ENG",))
 
     found = await sync._active_issues()
 
@@ -1284,3 +1307,150 @@ async def test_reconcile_runs_at_once_and_never_overlaps_a_slow_pass(boards):
 
     assert client.max_in_flight == 1
     assert client.active_calls >= 2
+
+
+# -- OPS team: its own state names, and hand-set states are left alone -----------
+
+
+def ops_event_setup(boards, key: str, card_status: str, assignee: str = "coder", **kwargs: Any) -> None:
+    boards.shows["t_1"] = {"id": "t_1", "tenant": key, "completed": False}
+    boards.cards_by[(BOARD, key)] = [card("t_1", card_status, assignee, **kwargs)]
+
+
+async def test_an_ops_claimed_card_writes_in_progress(boards):
+    client = FakeClient(current={"OPS-1": "Todo"})
+    ops_event_setup(boards, "OPS-1", "running")
+
+    await KanbanSync(client)._handle_event(BOARD, event(1, "t_1", "claimed"))
+
+    assert client.updates == [{"id": "issue-OPS-1", "stateId": "o-in-progress"}]
+
+
+async def test_an_ops_review_writes_in_review(boards):
+    client = FakeClient(current={"OPS-1": "In Progress"})
+    ops_event_setup(boards, "OPS-1", "review", "oracle")
+
+    await KanbanSync(client)._handle_event(BOARD, event(1, "t_1", "review_requested"))
+
+    assert client.updates == [{"id": "issue-OPS-1", "stateId": "o-in-review"}]
+
+
+async def test_an_ops_blocked_card_writes_blocked(boards):
+    client = FakeClient(current={"OPS-1": "In Progress"})
+    ops_event_setup(boards, "OPS-1", "blocked")
+
+    await KanbanSync(client)._handle_event(BOARD, event(1, "t_1", "blocked"))
+
+    assert client.updates == [{"id": "issue-OPS-1", "stateId": "o-blocked"}]
+
+
+@pytest.mark.parametrize("attachments", [[], [pr_link(7, "merged")]])
+async def test_ops_all_done_with_a_merged_or_no_pr_writes_done(boards, attachments):
+    client = FakeClient(current={"OPS-1": "In Review"}, attachments={"issue-OPS-1": attachments})
+    ops_event_setup(boards, "OPS-1", "done", completed_at=1)
+
+    await KanbanSync(client)._handle_event(BOARD, event(1, "t_1", "completed"))
+
+    assert client.updates == [{"id": "issue-OPS-1", "stateId": "o-done"}]
+
+
+async def test_an_ops_issue_already_in_its_state_is_not_rewritten(boards):
+    client = FakeClient(current={"OPS-1": "In Progress"})
+    ops_event_setup(boards, "OPS-1", "running")
+
+    await KanbanSync(client)._handle_event(BOARD, event(1, "t_1", "claimed"))
+
+    assert client.updates == []
+
+
+async def test_an_ops_issue_waiting_on_client_gets_no_event_write(boards):
+    client = FakeClient(current={"OPS-1": "Waiting on client"})
+    ops_event_setup(boards, "OPS-1", "running")
+
+    await KanbanSync(client)._handle_event(BOARD, event(1, "t_1", "claimed"))
+
+    assert client.updates == []
+
+
+async def test_waiting_on_client_is_only_hand_set_on_ops(boards):
+    # an ENG team that happened to have such a state is not protected
+    states = STATES + [("Waiting on client", "s-waiting", "started")]
+    client = FakeClient(current={"ENG-1": "Todo"}, states=states)
+    client.current["ENG-1"] = {"id": "s-waiting", "name": "Waiting on client", "type": "started"}
+    ops_event_setup(boards, "ENG-1", "running")
+
+    await KanbanSync(client)._handle_event(BOARD, event(1, "t_1", "claimed"))
+
+    assert client.updates == [{"id": "issue-ENG-1", "stateId": "s-working"}]
+
+
+async def test_an_ops_parent_rolls_up_to_in_progress_when_a_child_goes_in_progress(boards):
+    client = FakeClient(current={"OPS-3": "Todo"})
+    client.issue_states["issue-OPS-1"] = state("Todo", "OPS")
+    client.children["issue-OPS-1"] = [child_node("OPS-2", "Done"), child_node("OPS-3", "Todo")]
+    client.parents["OPS-3"] = {"id": "issue-OPS-1", "identifier": "OPS-1"}
+    boards.shows["t_3"] = {"id": "t_3", "tenant": "OPS-3", "completed": False}
+    boards.cards_by[(BOARD, "OPS-3")] = [card("t_3", "running", "coder")]
+
+    await KanbanSync(client)._handle_event(BOARD, event(1, "t_3", "claimed"))
+
+    assert client.updates == [
+        {"id": "issue-OPS-3", "stateId": "o-in-progress"},
+        {"id": "issue-OPS-1", "stateId": "o-in-progress"},
+    ]
+
+
+async def test_an_ops_parent_waiting_on_client_is_not_rolled_up(boards):
+    client = FakeClient(current={"OPS-3": "Todo"})
+    client.issue_states["issue-OPS-1"] = state("Waiting on client", "OPS")
+    client.children["issue-OPS-1"] = [child_node("OPS-3", "Todo")]
+    client.parents["OPS-3"] = {"id": "issue-OPS-1", "identifier": "OPS-1"}
+    boards.shows["t_3"] = {"id": "t_3", "tenant": "OPS-3", "completed": False}
+    boards.cards_by[(BOARD, "OPS-3")] = [card("t_3", "running", "coder")]
+
+    await KanbanSync(client)._handle_event(BOARD, event(1, "t_3", "claimed"))
+
+    assert client.updates == [{"id": "issue-OPS-3", "stateId": "o-in-progress"}]
+
+
+async def test_reconcile_writes_an_ops_issue_with_its_own_state_names(boards):
+    client = FakeClient(ops_pages={None: page([active_issue("OPS-5", "Todo")])})
+    boards.cards_by[(BOARD, "OPS-5")] = [card("t_a", "running", "coder")]
+
+    assert await KanbanSync(client).reconcile() == 1
+    assert client.updates == [{"id": "issue-OPS-5", "stateId": "o-in-progress"}]
+
+
+async def test_reconcile_skips_an_ops_issue_waiting_on_client(boards):
+    client = FakeClient(ops_pages={None: page([active_issue("OPS-5", "Waiting on client")])})
+    boards.cards_by[(BOARD, "OPS-5")] = [card("t_a", "running", "coder")]
+
+    assert await KanbanSync(client).reconcile() == 0
+    assert client.updates == []
+
+
+async def test_reconcile_rolls_an_ops_parent_up_to_in_progress(boards):
+    node = active_issue("OPS-1", "Todo", children=[child_node("OPS-2", "In Progress")])
+    client = FakeClient(ops_pages={None: page([node])})
+
+    assert await KanbanSync(client).reconcile() == 1
+    assert client.updates == [{"id": "issue-OPS-1", "stateId": "o-in-progress"}]
+
+
+async def test_active_issues_pages_every_team_key(boards):
+    client = FakeClient(
+        active_pages={None: page([active_issue("ENG-1", "Todo")])},
+        ops_pages={
+            None: page([active_issue("OPS-1", "Todo")], True, "c1"),
+            "c1": page([active_issue("OPS-2", "Todo")]),
+        },
+    )
+
+    found = await KanbanSync(client)._active_issues()
+
+    assert [node["identifier"] for node in found] == ["ENG-1", "OPS-1", "OPS-2"]
+    assert [(v["team"], v["after"]) for v in client.operations("ActiveIssues")] == [
+        ("ENG", None),
+        ("OPS", None),
+        ("OPS", "c1"),
+    ]
