@@ -105,16 +105,17 @@ DEFAULT_MAX_AGENT_HANDOFFS = 2
 # activity, which makes Linear mark the session complete (ENG-2222/ENG-2223).
 # The prefix comes from the i18n key `gateway.clarify.question`.
 CLARIFY_FALLBACK_PREFIX = "\u2753 "
+# How recent the elicitation must be for the fallback to count as a duplicate of
+# it. Core's fallback fires immediately after the failed disposition, so seconds.
+CLARIFY_FALLBACK_SUPPRESS_SECONDS = 10.0
 # ── Kanban notifier pings ─────────────────────────────────────────────────────
 # A `notify+wake` subscription sends a passive ping ("✔ [board] @coder Kanban
 # t_x done — …", i18n key `gateway.kanban.ping.*`, head `gateway.kanban.ping.head`)
 # through `send()` just before the wake turn starts. Posted as a `response` it
 # makes Linear mark the session complete while the agent is starting work; as a
 # non-ephemeral `thought` it stays in the timeline and the session stays active.
-KANBAN_PING_RE = re.compile(r"^\S+ (?:\[[^\]]+\] )?(?:@\S+ )?Kanban t_[0-9a-f]+\b")
-# How recent the elicitation must be for the fallback to count as a duplicate of
-# it. Core's fallback fires immediately after the failed disposition, so seconds.
-CLARIFY_FALLBACK_SUPPRESS_SECONDS = 10.0
+# The head starts with a status glyph, so a reply like "Reviewed Kanban t_x" is not a ping.
+KANBAN_PING_RE = re.compile(r"^[^\w\s]+ (?:\[[^\]]+\] )?(?:@\S+ )?Kanban t_[0-9a-f]+\b")
 
 
 def _clarify_now() -> float:

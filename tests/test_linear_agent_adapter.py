@@ -1860,6 +1860,8 @@ async def test_send_posts_kanban_pings_as_thoughts_so_the_session_stays_active()
     # The agent's own reply mentioning a card is still a response.
     await adapter.send("issue-1", "Kanban t_06b81f17 is unblocked.", metadata={})
     assert fake_client.calls[-1][0] == "response"
+    await adapter.send("issue-1", "Reviewed Kanban t_06b81f17, it is fine.", metadata={})
+    assert fake_client.calls[-1][0] == "response"
 
 
 def test_guidance_list_renders_rule_bodies():
