@@ -1663,6 +1663,39 @@ class LinearAgentAdapter(BasePlatformAdapter):
                 "delivery_id": context.delivery_id,
             }, 200
 
+        # The gateway re-checks the sender at dispatch against its own
+        # allowlist and silently drops the turn on reject. Ask it first (same
+        # inputs as _build_source) so the user sees an error, not a dead session.
+        if context.action in ("created", "prompted"):
+            gateway_session_id = context.thread_id or context.agent_session_id
+            verdict = self._is_sender_authorized(
+                context.actor_user_id, "thread", gateway_session_id, thread_id=gateway_session_id
+            )
+            if verdict is False:
+                logger.warning(
+                    "[linear_agent] Gateway would reject sender %s (%s) for session %s",
+                    context.actor_user_name,
+                    context.actor_user_id,
+                    context.agent_session_id,
+                )
+                try:
+                    await self._client.create_error(
+                        context.agent_session_id,
+                        f"Rejected: {context.actor_user_name or 'unknown'} "
+                        f"({context.actor_user_id}) is not in this agent's allowed users.",
+                    )
+                except Exception as exc:  # noqa: BLE001 - never fail the webhook
+                    logger.warning(
+                        "[linear_agent] Could not post rejection for session %s: %s",
+                        context.agent_session_id,
+                        exc,
+                    )
+                return {
+                    "status": "rejected",
+                    "reason": "sender not allowed by gateway",
+                    "delivery_id": context.delivery_id,
+                }, 200
+
         # Peer handoff cap: a `created` session from another agent app is only
         # dispatched while the issue still has few app-initiated sessions.
         # Humans never hit this path, and the count is read from Linear so a
