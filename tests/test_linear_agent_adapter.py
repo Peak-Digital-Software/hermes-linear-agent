@@ -1864,6 +1864,62 @@ async def test_send_posts_kanban_pings_as_thoughts_so_the_session_stays_active()
     assert fake_client.calls[-1][0] == "response"
 
 
+@pytest.mark.asyncio
+async def test_send_posts_failed_turn_replies_as_error_activities():
+    """The gateway appends a failed-turn notice as the LAST paragraph of the
+    response (gateway/run_turn.py). Posted as a `response`, Linear shows the
+    failure as a complete answer; it has to be an `error` activity."""
+    from agent.turn_failure_copy import PARTIAL_FAILED_TURN_NOTICE
+
+    fake_client = _FakeLinearClient()
+    adapter = _make_adapter(client=fake_client)
+    adapter._latest_agent_session["issue-1"] = "session-1"
+
+    body = f"\u26a0\ufe0f The AI model service kept failing on all 3 attempts.\n\n{PARTIAL_FAILED_TURN_NOTICE}"
+    result = await adapter.send("issue-1", body, metadata={})
+
+    assert result.success is True
+    assert result.message_id == "error-1"
+    assert [c[0] for c in fake_client.calls] == ["error"]
+    assert fake_client.calls[0][1] == "session-1"
+    assert PARTIAL_FAILED_TURN_NOTICE in fake_client.calls[0][2]
+
+
+@pytest.mark.asyncio
+async def test_send_posts_bare_failed_turn_notice_as_error_activity():
+    """With no provider copy to prepend, the notice is the whole response."""
+    from agent.turn_failure_copy import FAILED_TURN_NOTICE
+
+    fake_client = _FakeLinearClient()
+    adapter = _make_adapter(client=fake_client)
+    adapter._latest_agent_session["issue-1"] = "session-1"
+
+    result = await adapter.send("issue-1", FAILED_TURN_NOTICE, metadata={})
+
+    assert result.success is True
+    assert result.message_id == "error-1"
+    assert [c[0] for c in fake_client.calls] == ["error"]
+    assert fake_client.calls[0][2] == FAILED_TURN_NOTICE
+
+
+@pytest.mark.asyncio
+async def test_send_keeps_quoting_the_failed_turn_notice_mid_message_as_response():
+    """Only a notice as the FINAL paragraph marks a failed turn; a reply that
+    merely quotes the sentence is still a normal answer."""
+    from agent.turn_failure_copy import PARTIAL_FAILED_TURN_NOTICE
+
+    fake_client = _FakeLinearClient()
+    adapter = _make_adapter(client=fake_client)
+    adapter._latest_agent_session["issue-1"] = "session-1"
+
+    content = f"The sentinel text is `{PARTIAL_FAILED_TURN_NOTICE}`.\n\nIt now posts as an error activity."
+    result = await adapter.send("issue-1", content, metadata={})
+
+    assert result.success is True
+    assert [c[0] for c in fake_client.calls] == ["response"]
+    assert fake_client.calls[0][2] == content
+
+
 def test_guidance_list_renders_rule_bodies():
     """Linear sends guidance as [{body, origin}] — the prompt must carry the
     rule text, never a stringified dict."""
