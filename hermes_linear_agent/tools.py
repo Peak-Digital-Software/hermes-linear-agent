@@ -87,6 +87,25 @@ def _looks_like_uuid(value: Any) -> bool:
     return bool(value) and bool(_UUID_RE.match(str(value).strip()))
 
 
+async def _current_agent_session_id() -> str:
+    """Agent session id of the turn running this tool call, or ``""``.
+
+    The gateway binds the session platform/chat id (the ISSUE id for this
+    platform) per turn; the adapter maps it to the newest agent session.
+    """
+    try:
+        from gateway.session_context import get_session_env
+    except ImportError:
+        return ""
+    if get_session_env("HERMES_SESSION_PLATFORM") != "linear_agent":
+        return ""
+    chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
+    if not chat_id:
+        return ""
+    session_id, _issue_id = await get_active_adapter()._resolve_reply_session(chat_id)
+    return session_id or ""
+
+
 def _resolve_named(
     candidates: list[dict[str, Any]],
     value: Any,
@@ -581,11 +600,11 @@ def _schema(
     name: str,
     description: str,
     properties: dict[str, Any],
-    required: list[str] | None = None,
 ) -> dict[str, Any]:
+    # No schema emits ``required``: Hermes core rejects a deferred tool_call
+    # missing a required name before the handler runs, hiding the alias
+    # handling in the handlers. Each handler owns its own ``❌ … missing …``.
     parameters: dict[str, Any] = {"type": "object", "properties": properties}
-    if required:
-        parameters["required"] = required
     return {"name": name, "description": description, "parameters": parameters}
 
 
@@ -614,8 +633,17 @@ async def linear_agent_update_issue(*args, **kwargs) -> str:
         # (both resolvers prefer input scope over this fallback, so a move
         # resolves state/labels/cycle against the DESTINATION team).
         team_id = project_id = None
-        if _references_need_issue(input_data):
+        # Mutations need the UUID; resolve an identifier (ENG-123) once and
+        # reuse that fetch for name resolution.
+        issue = None
+        if not _looks_like_uuid(issue_id):
             issue = await client.get_issue(issue_id)
+            if not issue or not issue.get("id"):
+                return f"❌ linear_agent_update_issue: issue {issue_id} not found"
+            issue_id = issue["id"]
+        if _references_need_issue(input_data):
+            if issue is None:
+                issue = await client.get_issue(issue_id)
             team_id = ((issue or {}).get("team") or {}).get("id")
             project_id = ((issue or {}).get("project") or {}).get("id")
         error = await _resolve_issue_references(
@@ -948,7 +976,7 @@ async def linear_agent_set_session_links(*args, **kwargs) -> str:
     marked unresponsive during long work.
     """
     kwargs = _merge_tool_args(args, kwargs)
-    session_id = _first(kwargs, "agent_session_id", "session_id", "id")
+    session_id = _first(kwargs, "agent_session_id", "session_id", "id") or await _current_agent_session_id()
     links = kwargs.get("links") or kwargs.get("urls")
     if not session_id:
         return "❌ linear_agent_set_session_links: missing agent_session_id (shown in your session prompt)"
@@ -996,7 +1024,7 @@ async def linear_agent_request_auth(*args, **kwargs) -> str:
     resumes the session after authenticating.
     """
     kwargs = _merge_tool_args(args, kwargs)
-    session_id = _first(kwargs, "agent_session_id", "session_id", "id")
+    session_id = _first(kwargs, "agent_session_id", "session_id", "id") or await _current_agent_session_id()
     if not session_id:
         return "❌ linear_agent_request_auth: missing agent_session_id (shown in your session prompt)"
 
@@ -1075,7 +1103,7 @@ async def linear_agent_update_plan(*args, **kwargs) -> str:
     current status.
     """
     kwargs = _merge_tool_args(args, kwargs)
-    session_id = _first(kwargs, "agent_session_id", "session_id", "id")
+    session_id = _first(kwargs, "agent_session_id", "session_id", "id") or await _current_agent_session_id()
     plan = kwargs.get("plan")
     if not session_id:
         return "❌ linear_agent_update_plan: missing agent_session_id (shown in your session prompt)"
@@ -1497,7 +1525,6 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
                     "attachments)."
                 ),
             },
-            ["input"],
         ),
         "🔄",
     ),
@@ -1549,7 +1576,6 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
                     "description": "Comment on a document. Pass exactly ONE parent.",
                 },
             },
-            ["body"],
         ),
         "💬",
     ),
@@ -1570,7 +1596,6 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
                     "([{url,title}] append-only). Raw *Id keys also pass through."
                 ),
             },
-            ["team_id", "input"],
         ),
         "➕",
     ),
@@ -1584,7 +1609,6 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
                     "Project fields. Common keys: name, description, teamIds (array), icon, color, priority, state."
                 ),
             },
-            ["input"],
         ),
         "🆕",
     ),
@@ -1603,7 +1627,6 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
                     "Fields to update. Common keys: name, description, state, priority, icon, color, teamIds."
                 ),
             },
-            ["input"],
         ),
         "📝",
     ),
@@ -1619,7 +1642,6 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
                     "Project update fields. Common keys: projectId, body, health (onTrack|atRisk|offTrack), isDiffHidden."
                 ),
             },
-            ["input"],
         ),
         "📊",
     ),
@@ -1629,7 +1651,6 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
             "linear_agent_create_document",
             _preferred("Create a new Linear document.", "mcp_linear_save_document"),
             {"input": _input_prop("Document fields. Common keys: title, content, projectId, icon, color.")},
-            ["input"],
         ),
         "📄",
     ),
@@ -1639,7 +1660,6 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
             "linear_agent_create_milestone",
             _preferred("Create a new Linear milestone.", "mcp_linear_save_milestone"),
             {"input": _input_prop("Milestone fields. Common keys: name, description, projectId, targetDate.")},
-            ["input"],
         ),
         "🎯",
     ),
@@ -1653,7 +1673,6 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
                     "Customer need fields. Common keys: body, customerId, issueId, projectId, priority."
                 )
             },
-            ["input"],
         ),
         "🙋",
     ),
@@ -1689,7 +1708,6 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
                 "status": {"type": "string", "description": "Alias for name"},
                 "team": {"type": "string", "description": "Team UUID or name"},
             },
-            ["name"],
         ),
         "🔍",
     ),
@@ -1703,7 +1721,6 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
                 "issue_id": {"type": "string"},
                 "task_id": {"type": "string"},
             },
-            ["id"],
         ),
         "📄",
     ),
@@ -1745,7 +1762,6 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
                 "project_id": {"type": "string"},
                 "projectId": {"type": "string"},
             },
-            ["id"],
         ),
         "📁",
     ),
@@ -1791,7 +1807,6 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
             "linear_agent_get_customer",
             "Fetch a single customer by ID.",
             {"id": {"type": "string"}, "customer_id": {"type": "string"}},
-            ["id"],
         ),
         "👤",
     ),
@@ -1810,7 +1825,6 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
             "linear_agent_get_initiative",
             "Fetch a single initiative by ID.",
             {"id": {"type": "string"}, "initiative_id": {"type": "string"}},
-            ["id"],
         ),
         "🚀",
     ),
@@ -1838,7 +1852,6 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
             "linear_agent_get_release",
             "Fetch a single release by ID.",
             {"id": {"type": "string"}, "release_id": {"type": "string"}},
-            ["id"],
         ),
         "🚢",
     ),
@@ -1853,7 +1866,6 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
                 "id": {"type": "string"},
                 "limit": _LIMIT,
             },
-            ["issue_id"],
         ),
         "💬",
     ),
@@ -1872,7 +1884,6 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
             "linear_agent_get_user",
             "Fetch a single user by ID.",
             {"id": {"type": "string"}, "user_id": {"type": "string"}},
-            ["id"],
         ),
         "👤",
     ),
@@ -1901,7 +1912,6 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
                     "Fields: body (Markdown, literal newlines), health (onTrack|atRisk|offTrack), projectId (project updates) OR initiativeId (initiative updates) — one is required for create"
                 ),
             },
-            ["input"],
         ),
         "📝",
     ),
@@ -1935,7 +1945,6 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
             "linear_agent_get_status_update",
             "Fetch a single status update by ID.",
             {"id": {"type": "string"}, "update_id": {"type": "string"}},
-            ["id"],
         ),
         "🔍",
     ),
@@ -1948,7 +1957,6 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
                 "Existing milestone ID (omit to create new)",
                 "Fields: name (required), projectId (required for create), description, targetDate",
             ),
-            ["input"],
         ),
         "🎯",
     ),
@@ -1961,7 +1969,6 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
                 "Existing customer need ID (omit to create new)",
                 "Fields: body, customerId, issueId, projectId, priority (0=Not important, 1=Important — NOT the issue priority scale), source (URL)",
             ),
-            ["input"],
         ),
         "🙋",
     ),
@@ -1974,7 +1981,6 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
                 "Existing document ID (omit to create new)",
                 "Fields: title, content, projectId, icon, color",
             ),
-            ["input"],
         ),
         "📄",
     ),
@@ -1987,7 +1993,6 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
                 "Existing initiative ID (omit to create new)",
                 "Fields: name, description, status, ownerId, targetDate",
             ),
-            ["input"],
         ),
         "🚀",
     ),
@@ -2008,7 +2013,6 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
                     "items": {"type": ["object", "string"]},
                 },
             },
-            ["agent_session_id", "links"],
         ),
         "🔗",
     ),
@@ -2042,7 +2046,6 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
                     "description": "Optional initiating user ID (the Initiating user ID from your prompt).",
                 },
             },
-            ["agent_session_id", "url"],
         ),
         "🔐",
     ),
@@ -2071,7 +2074,6 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
                     "items": {"type": ["object", "string"]},
                 },
             },
-            ["agent_session_id", "plan"],
         ),
         "🗺️",
     ),
@@ -2084,7 +2086,6 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
                 "Existing release ID (omit to create new)",
                 "Fields: name (required), pipelineId (required for create — find it with linear_agent_list_release_pipelines), description, version, targetDate",
             ),
-            ["input"],
         ),
         "🏷️",
     ),
@@ -2098,7 +2099,6 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
                 "id": {"type": "string", "description": "Comment ID to delete. Also accepts comment_id."},
                 "comment_id": {"type": "string", "description": "Alternative name for the comment ID."},
             },
-            ["id"],
         ),
         "🗑️",
     ),
@@ -2112,7 +2112,6 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
                 "id": {"type": "string", "description": "Customer need ID to delete. Also accepts need_id."},
                 "need_id": {"type": "string", "description": "Alternative name for the customer need ID."},
             },
-            ["id"],
         ),
         "🗑️",
     ),
@@ -2132,7 +2131,6 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
                     "description": "Which kind of status update (default project).",
                 },
             },
-            ["id"],
         ),
         "🗑️",
     ),
@@ -2146,7 +2144,6 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
                 "id": {"type": "string", "description": "Attachment ID to delete. Also accepts attachment_id."},
                 "attachment_id": {"type": "string", "description": "Alternative name for the attachment ID."},
             },
-            ["id"],
         ),
         "🗑️",
     ),
@@ -2165,7 +2162,6 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
                 "Fields: name (required to create), domains, externalIds, logoUrl, "
                 "mainSourceId, ownerId, revenue, size, slackChannelId, statusId, tierId",
             ),
-            ["input"],
         ),
         "🏢",
     ),
@@ -2179,7 +2175,6 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
                 "id": {"type": "string", "description": "Customer ID to delete. Also accepts customer_id."},
                 "customer_id": {"type": "string", "description": "Alternative name for the customer ID."},
             },
-            ["id"],
         ),
         "🗑️",
     ),
@@ -2199,7 +2194,6 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
                 "linear_agent_list_release_pipelines; pipeline_id alias accepted), "
                 "title, content, releaseIds, rangeFromReleaseId, rangeToReleaseId",
             ),
-            ["input"],
         ),
         "📰",
     ),
@@ -2218,7 +2212,6 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
                     "Label fields: name (required), color (hex), description, parentId, isGroup. teamId may also be set here."
                 ),
             },
-            ["input"],
         ),
         "🏷️",
     ),
@@ -2228,7 +2221,6 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
             "linear_agent_get_team",
             "Fetch a single team by ID.",
             {"id": {"type": "string"}, "team_id": {"type": "string"}, "teamId": {"type": "string"}},
-            ["id"],
         ),
         "👥",
     ),
@@ -2238,7 +2230,6 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
             "linear_agent_get_milestone",
             "Fetch a single project milestone by ID.",
             {"id": {"type": "string"}, "milestone_id": {"type": "string"}},
-            ["id"],
         ),
         "🎯",
     ),
@@ -2248,7 +2239,6 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
             "linear_agent_get_document",
             "Fetch a single document by ID or slug.",
             {"id": {"type": "string"}, "document_id": {"type": "string"}},
-            ["id"],
         ),
         "📄",
     ),
@@ -2258,7 +2248,6 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
             "linear_agent_get_attachment",
             "Fetch a single attachment by ID.",
             {"id": {"type": "string"}, "attachment_id": {"type": "string"}},
-            ["id"],
         ),
         "📎",
     ),
@@ -2268,7 +2257,6 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
             "linear_agent_get_release_note",
             "Fetch a single release note by ID.",
             {"id": {"type": "string"}, "release_note_id": {"type": "string"}},
-            ["id"],
         ),
         "📰",
     ),
@@ -2278,7 +2266,6 @@ _TOOLS: list[tuple[Callable[..., Any], dict[str, Any], str]] = [
             "linear_agent_get_agent_skill",
             "Fetch a single agent skill by ID.",
             {"id": {"type": "string"}, "skill_id": {"type": "string"}},
-            ["id"],
         ),
         "🛠️",
     ),

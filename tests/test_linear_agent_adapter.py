@@ -344,7 +344,7 @@ def test_linear_agent_mutation_tools_dispatch_positional_dicts():
 
         update_result = tool_registry.dispatch(
             "linear_agent_update_issue",
-            {"issue_id": "PLAT-18557", "input": {"stateId": "state-1"}},
+            {"issue_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "input": {"stateId": "state-1"}},
         )
         comment_result = tool_registry.dispatch(
             "linear_agent_create_comment",
@@ -369,14 +369,14 @@ def test_linear_agent_mutation_tools_dispatch_positional_dicts():
     finally:
         set_active_adapter(None)
 
-    assert "✅ Updated PLAT-18557" in update_result
+    assert "✅ Updated aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" in update_result
     assert "✅ Comment added to PLAT-18557" in comment_result
     assert "✅ Created PLAT-1" in create_result
     assert "✅ Created project Test Project" in project_create
     assert "✅ Updated project proj-1" in project_update
     assert "✅ Created project update" in project_status
     assert adapter._client.calls == [
-        ("update_issue", "PLAT-18557", {"stateId": "state-1"}, adapter._mutation_policy),
+        ("update_issue", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", {"stateId": "state-1"}, adapter._mutation_policy),
         ("create_comment", "PLAT-18557", "Moving to In Review for QA", adapter._mutation_policy),
         (
             "create_issue",

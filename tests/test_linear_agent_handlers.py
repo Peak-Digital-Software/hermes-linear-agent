@@ -376,9 +376,11 @@ async def test_update_issue_prefers_state_id_over_state_name():
     adapter = _adapter_with_state_client()
     client = adapter._client
 
-    result = await t.linear_agent_update_issue(issue_id="PLAT-1", input={"stateId": "state-explicit", "state": "Done"})
+    result = await t.linear_agent_update_issue(
+        issue_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", input={"stateId": "state-explicit", "state": "Done"}
+    )
 
-    assert "✅ Updated PLAT-1" in result
+    assert "✅ Updated aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" in result
     update_call = [c for c in client.calls if c[0] == "update_issue"][0]
     assert update_call[2] == {"stateId": "state-explicit"}
     # No lookups needed when stateId is given.
@@ -837,11 +839,11 @@ async def test_update_issue_state_resolves_against_destination_team():
     client = adapter._client
 
     result = await t.linear_agent_update_issue(
-        issue_id="ENG-1",
+        issue_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
         input={"team": "Platform", "state": "Done"},
     )
 
-    assert "✅ Updated ENG-1" in result
+    assert "✅ Updated aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" in result
     # The issue lives on team-1; the move targets team-2 (Platform), so the
     # workflow-state lookup must use team-2.
     assert ("get_issue_status", "Done", "team-2") in client.calls
@@ -862,11 +864,11 @@ async def test_update_issue_raw_team_id_scopes_labels_to_destination():
     client = adapter._client
 
     result = await t.linear_agent_update_issue(
-        issue_id="ENG-1",
+        issue_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
         input={"teamId": "team-2", "labels": ["Bug"], "state": "Done"},
     )
 
-    assert "✅ Updated ENG-1" in result
+    assert "✅ Updated aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" in result
     assert ("list_issue_labels", "team-2") in client.calls
     assert ("get_issue_status", "Done", "team-2") in client.calls
     assert not any(c[0] == "get_issue" for c in client.calls)
@@ -1543,7 +1545,7 @@ def test_request_auth_registered_schema_and_toolset():
     entry = captured["linear_agent_request_auth"]
     assert entry["toolset"] == "linear_agent"
     assert entry["handler"].__name__ == "linear_agent_request_auth"
-    assert entry["schema"]["parameters"]["required"] == ["agent_session_id", "url"]
+    assert "required" not in entry["schema"]["parameters"]
     registered = tool_registry.get_entry("linear_agent_request_auth")
     assert registered is not None
     assert registered.is_async is True
