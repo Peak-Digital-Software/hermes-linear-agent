@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
+from agent.turn_failure_copy import FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE
 from utils import is_truthy_value as _boolish
 
 try:
@@ -116,6 +117,13 @@ CLARIFY_FALLBACK_SUPPRESS_SECONDS = 10.0
 # non-ephemeral `thought` it stays in the timeline and the session stays active.
 # The head starts with a status glyph, so a reply like "Reviewed Kanban t_x" is not a ping.
 KANBAN_PING_RE = re.compile(r"^[^\w\s]+ (?:\[[^\]]+\] )?(?:@\S+ )?Kanban t_[0-9a-f]+\b")
+# ── Failed turns ──────────────────────────────────────────────────────────────
+# Linear renders a `response` activity as the agent's complete answer and an
+# `error` activity as an error. The gateway passes no failure flag in `metadata`:
+# on every failed turn it appends FAILED_TURN_NOTICE / PARTIAL_FAILED_TURN_NOTICE
+# (hermes-agent `agent/turn_failure_copy.py`) as the LAST paragraph of the
+# response (`gateway/run_turn.py`), so that trailing notice is the signal.
+FAILED_TURN_NOTICES = (FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE)
 
 
 def _clarify_now() -> float:
@@ -1113,6 +1121,16 @@ class LinearAgentAdapter(BasePlatformAdapter):
                 activity = await self._client.create_thought(agent_session_id, content[: self.MAX_MESSAGE_LENGTH])
             except Exception as exc:  # noqa: BLE001 - adapter boundary returns SendResult
                 logger.warning("[linear_agent] Failed to create kanban thought activity: %s", exc)
+                return SendResult(success=False, error=str(exc))
+            return SendResult(success=True, message_id=str(activity.get("id") or "") or None)
+        # A failed turn's reply carries the gateway's notice as its final
+        # paragraph. Post it as `error` so Linear does not show the failure as a
+        # completed answer, and skip chunking/source-thread mirroring here.
+        if content.rstrip().endswith(FAILED_TURN_NOTICES):
+            try:
+                activity = await self._client.create_error(agent_session_id, content[: self.MAX_MESSAGE_LENGTH])
+            except Exception as exc:  # noqa: BLE001 - adapter boundary returns SendResult
+                logger.warning("[linear_agent] Failed to create failed-turn error activity: %s", exc)
                 return SendResult(success=False, error=str(exc))
             return SendResult(success=True, message_id=str(activity.get("id") or "") or None)
         chunks = _split_message(content, self.MAX_MESSAGE_LENGTH)

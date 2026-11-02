@@ -6,6 +6,7 @@ All notable changes to this project will be documented here.
 
 ### Fixed
 
+- Post a failed turn's reply as a Linear `error` activity (recognised by the gateway's trailing `FAILED_TURN_NOTICE` / `PARTIAL_FAILED_TURN_NOTICE`) so the agent session shows `error` instead of a spurious `complete`. Normal replies still post `response`; kanban pings still post `thought`.
 - The `linear_agent_*` tools now work in processes where the gateway adapter never connected (desktop chat, CLI, cron). With no active adapter, the registry lazily builds one fallback adapter from the effective platform config — no webhook listener, no platform lock, no viewer query — reusing the cached OAuth token and only minting a new one when it expires. A connected gateway adapter still takes precedence.
 
 ## 0.4.2 — 2026-07-29
