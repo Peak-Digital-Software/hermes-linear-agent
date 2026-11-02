@@ -151,14 +151,19 @@ class KanbanSync:
         return [self._discovery_task, self._reconcile_task]
 
     async def _discover_loop(self) -> None:
-        while True:
-            try:
-                await self._poll_boards()
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:  # noqa: BLE001 - one line, then try again
-                logger.warning("boards() failed: %s", _err_line(error))
-            await asyncio.sleep(self.discovery_seconds)
+        try:
+            while True:
+                try:
+                    await self._poll_boards()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:  # noqa: BLE001 - one line, then try again
+                    logger.warning("boards() failed: %s", _err_line(error))
+                await asyncio.sleep(self.discovery_seconds)
+        finally:
+            # The adapter only tracks start()'s tasks; followers live and die with discovery.
+            for follower in self._followers:
+                follower.cancel()
 
     async def _poll_boards(self) -> list[str]:
         """Start one follower per board slug this process has not seen yet."""
@@ -176,12 +181,12 @@ class KanbanSync:
     # -- card events -> issue status ---------------------------------------
 
     async def _follow_forever(self, board: str, db_path: str | None) -> None:
-        cursor: int | None = None
         while True:
             try:
-                if cursor is None:
-                    cursor = await self._seed_cursor(board, db_path)
-                cursor = await self._follow(board, db_path, cursor)
+                # _follow never returns, so a retry must resume from the persisted
+                # cursor, not the stale one it started with.
+                cursor = await self._seed_cursor(board, db_path)
+                await self._follow(board, db_path, cursor)
             except asyncio.CancelledError:
                 raise
             except Exception as error:  # noqa: BLE001 - a follower never dies

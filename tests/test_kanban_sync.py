@@ -620,6 +620,46 @@ async def test_start_returns_the_discovery_and_reconcile_tasks(boards):
         await asyncio.gather(*tasks, *sync._followers, return_exceptions=True)
 
 
+async def test_cancelling_the_discovery_task_cancels_its_followers(boards):
+    sync = KanbanSync(FakeClient(), discovery_seconds=60, reconcile_seconds=60, poll_seconds=0.01)
+    boards.cursors[BOARD] = 0
+
+    discovery, reconcile = sync.start()
+    await until(lambda: BOARD in sync._started_boards)
+    followers = list(sync._followers)
+    assert followers
+    discovery.cancel()
+    reconcile.cancel()
+    await asyncio.gather(discovery, reconcile, *followers, return_exceptions=True)
+
+    assert all(task.done() for task in followers)
+
+
+async def test_a_follower_retry_resumes_from_the_saved_cursor_not_the_seed(boards, monkeypatch):
+    sync = KanbanSync(FakeClient(), poll_seconds=0.01)
+    boards.events[BOARD] = [event(5, "t_1", "heartbeat")]
+    calls = {"n": 0}
+    real = boards.read_events
+
+    def flaky(db_path, after, limit=200):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("database is locked")
+        return real(db_path, after, limit)
+
+    monkeypatch.setattr(kanban_cli, "read_events", flaky)
+    boards.cursors[BOARD] = 0
+    task = asyncio.create_task(sync._follow_forever(BOARD, f"/tmp/{BOARD}.db"))
+    try:
+        await until(lambda: calls["n"] >= 4)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert boards.cursors[BOARD] == 5
+    assert boards.saved == [(BOARD, 5)]
+
+
 # -- reconcile ----------------------------------------------------------------
 
 
