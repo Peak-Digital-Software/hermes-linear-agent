@@ -32,7 +32,17 @@ from typing import Any
 import watchfiles
 
 from . import kanban_cli
-from .kanban_rules import ACTED, CLOSED_TYPES, Card, is_open, issue_status, rollup, transition
+from .kanban_rules import (
+    ACTED,
+    CLOSED_TYPES,
+    Card,
+    hand_set,
+    is_open,
+    issue_status,
+    rollup,
+    team_state_name,
+    transition,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -160,14 +170,14 @@ class KanbanSync:
     def __init__(
         self,
         client: Any,
-        team_key: str = "ENG",
+        team_keys: tuple[str, ...] = ("ENG", "OPS"),
         *,
         wake: Callable[[str, str, str], None] | None = None,
         boards_root: Path | None = None,
         reconcile_seconds: float = RECONCILE_SECONDS,
     ) -> None:
         self._client = client
-        self.team_key = team_key
+        self.team_keys = tuple(team_keys)
         self.reconcile_seconds = reconcile_seconds
         self._wake = wake
         self.boards_root = Path(boards_root) if boards_root is not None else Path.home() / ".hermes/kanban/boards"
@@ -346,12 +356,28 @@ class KanbanSync:
         if children:
             # An issue with sub-issues takes their rollup, never its own cards.
             status = rollup([str((child.get("state") or {}).get("name") or "") for child in children])
-        current = issue.get("state") or {}
-        if current.get("type") in CLOSED_TYPES or status is None or status == current.get("name"):
+        target = self._target(issue, status)
+        if target is None:
             return
-        logger.info("%s %s %s -> %s status %s", board, task_id, kind, issue_key, status)
-        await self._set_status(issue_key, status)
-        await self._rollup_parent(issue, status)
+        logger.info("%s %s %s -> %s status %s", board, task_id, kind, issue_key, target)
+        await self._set_status(issue_key, target)
+        await self._rollup_parent(issue, target)
+
+    @staticmethod
+    def _target(issue: dict[str, Any], status: str | None) -> str | None:
+        """The team's name for ``status``, or None when nothing should be written."""
+        if status is None:
+            return None
+        current = issue.get("state") or {}
+        if current.get("type") in CLOSED_TYPES:
+            return None
+        team_key = (issue.get("team") or {}).get("key")
+        if hand_set(team_key, current.get("name")):
+            return None
+        name = team_state_name(team_key, status)
+        if name == current.get("name"):
+            return None
+        return name
 
     async def _rollup_parent(self, issue: dict[str, Any], status: str) -> None:
         """Move the issue's parent to the rollup of its children, when it changes."""
@@ -371,12 +397,10 @@ class KanbanSync:
             else:
                 states.append(str((child.get("state") or {}).get("name") or ""))
 
-        rolled = rollup(states)
+        rolled = self._target(node, rollup(states))
         if rolled is None:
             return
         current = node.get("state") or {}
-        if rolled == current.get("name"):
-            return
         await self._set_status(str(parent_id), rolled)
         logger.info("rollup %s: %s -> %s", parent.get("identifier") or parent_id, current.get("name"), rolled)
 
@@ -418,7 +442,8 @@ class KanbanSync:
                 status = issue_status(cards, issue.get("attachments") or [])
 
             state = issue.get("state") or {}
-            if status is None or status == state.get("name"):
+            target = self._target(issue, status)
+            if target is None:
                 continue
 
             team_id = (issue.get("team") or {}).get("id")
@@ -426,7 +451,7 @@ class KanbanSync:
                 continue
             if team_id not in states_by_team:
                 states_by_team[team_id] = await self._team_state_ids(team_id)
-            state_id = states_by_team[team_id].get(status)
+            state_id = states_by_team[team_id].get(target)
             if not state_id:
                 continue  # no such state on the team: nothing safe to write
 
@@ -434,7 +459,7 @@ class KanbanSync:
             if not issue_id:
                 continue
             await self._update_issue(issue_id, state_id)
-            logger.info("reconcile %s: %s -> %s", key, state.get("name"), status)
+            logger.info("reconcile %s: %s -> %s", key, state.get("name"), target)
             changes += 1
 
         return changes
@@ -569,18 +594,20 @@ class KanbanSync:
 
     async def _active_issues(self) -> list[dict[str, Any]]:
         found: list[dict[str, Any]] = []
-        after: str | None = None
-        while True:
-            data = await self._execute(ACTIVE_ISSUES, {"team": self.team_key, "after": after})
-            page = data.get("issues") or {}
-            for node in page.get("nodes") or []:
-                normalized = _normalize_issue(node)
-                if normalized is not None:
-                    found.append(normalized)
-            info = page.get("pageInfo") or {}
-            if not info.get("hasNextPage") or not info.get("endCursor"):
-                return found
-            after = info.get("endCursor")
+        for team_key in self.team_keys:
+            after: str | None = None
+            while True:
+                data = await self._execute(ACTIVE_ISSUES, {"team": team_key, "after": after})
+                page = data.get("issues") or {}
+                for node in page.get("nodes") or []:
+                    normalized = _normalize_issue(node)
+                    if normalized is not None:
+                        found.append(normalized)
+                info = page.get("pageInfo") or {}
+                if not info.get("hasNextPage") or not info.get("endCursor"):
+                    break
+                after = info.get("endCursor")
+        return found
 
 
 def _normalize_issue(node: object) -> dict[str, Any] | None:
