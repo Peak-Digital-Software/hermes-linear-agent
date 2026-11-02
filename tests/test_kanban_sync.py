@@ -833,6 +833,30 @@ async def test_the_follower_reads_once_on_start_and_saves_the_cursor_after_each_
     assert boards.saved == [(BOARD, 1), (BOARD, 2)]
 
 
+async def test_the_follower_watches_only_the_db_folder_not_its_subtree(boards, monkeypatch):
+    # The default board's db is ~/.hermes/kanban.db: a recursive watch on ~/.hermes exhausts inotify.
+    seen: list[tuple[tuple, dict]] = []
+
+    async def record(*paths, **kwargs):
+        seen.append((paths, kwargs))
+        await asyncio.Event().wait()
+        yield set()  # pragma: no cover
+
+    monkeypatch.setattr(kanban_sync, "_awatch", record)
+    sync = KanbanSync(FakeClient())
+    boards.cursors[BOARD] = 0
+    task = asyncio.create_task(sync._follow_forever(BOARD, f"/tmp/{BOARD}.db"))
+    try:
+        await until(lambda: bool(seen))
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    paths, kwargs = seen[0]
+    assert paths == ("/tmp",)
+    assert kwargs["recursive"] is False
+
+
 async def test_a_filesystem_change_reads_the_events_that_landed_after_the_start(boards, watch):
     sync = KanbanSync(FakeClient())
     boards.cursors[BOARD] = 0
