@@ -9,13 +9,12 @@ license-files = ["LICENSE"]
 authors = [{ name = "Ritchie" }]
 dependencies = [
   "aiohttp>=3.12",
+  "watchfiles>=0.20,<2",
 ]
 classifiers = [
   "Development Status :: 4 - Beta",
   "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3.11",
-  "Programming Language :: Python :: 3.12",
-  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
 ]
 
 [project.urls]
