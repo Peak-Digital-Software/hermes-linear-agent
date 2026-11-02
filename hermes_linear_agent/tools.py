@@ -403,11 +403,12 @@ async def _apply_issue_relations(client, issue_id: str, rel: dict, policy) -> li
     results: list[str] = []
 
     async def _create(source: str, target: str, rel_type: str, label: str) -> None:
+        other = source if target == issue_id else target
         try:
             await client.create_issue_relation(source, target, rel_type, mutation_policy=policy)
-            results.append(f"{label} {target}")
+            results.append(f"{label} {other}")
         except Exception as e:  # noqa: BLE001 - partial-failure reporting
-            results.append(f"failed to {label} {target} ({e})")
+            results.append(f"failed to {label} {other} ({e})")
 
     # Appends. blockedBy is the INVERSE of blocks: "X blocked by B" == "B blocks X".
     for target in _as_id_list(rel.get("blocks")):

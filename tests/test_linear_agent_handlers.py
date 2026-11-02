@@ -960,6 +960,28 @@ async def test_update_issue_blocks_vs_blocked_by_direction():
 
 
 @pytest.mark.asyncio
+async def test_update_issue_blocked_by_message_names_blocker():
+    """The confirmation names the blocker (ENG-3), not the updated issue."""
+    from hermes_linear_agent import tools as t
+
+    adapter = _adapter_with_ref_client()
+    result = await t.linear_agent_update_issue(issue_id="ENG-1", input={"blockedBy": ["ENG-3"]})
+    assert "blocked by ENG-3" in result
+    assert "blocked by ENG-1" not in result
+
+    adapter = _adapter_with_ref_client()
+    client = adapter._client
+
+    async def _boom(*a, **k):
+        raise RuntimeError("nope")
+
+    client.create_issue_relation = _boom
+    result = await t.linear_agent_update_issue(issue_id="ENG-1", input={"blockedBy": ["ENG-3"]})
+    assert "failed to blocked by ENG-3" in result
+    assert "failed to blocked by ENG-1" not in result
+
+
+@pytest.mark.asyncio
 async def test_create_issue_relation_maps_graphql_variables():
     """Client-level: source→issueId, target→relatedIssueId, type→type."""
 
