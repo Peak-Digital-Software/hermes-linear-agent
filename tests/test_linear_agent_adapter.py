@@ -1605,7 +1605,9 @@ async def test_create_response_passes_signal_metadata_only_when_set():
     client.create_response = lambda *a, **k: LinearGraphQLClient.create_response(client, *a, **k)
     options = {"options": [{"label": "a", "value": "a"}]}
 
-    await client.create_response("session-1", "Pick", response_type="elicitation", signal="select", signal_metadata=options)
+    await client.create_response(
+        "session-1", "Pick", response_type="elicitation", signal="select", signal_metadata=options
+    )
     await client.create_response("session-1", "Pick", response_type="elicitation", signal="select")
 
     with_meta, without_meta = (variables["input"] for _, variables in client.operations)

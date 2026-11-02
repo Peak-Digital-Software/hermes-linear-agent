@@ -113,6 +113,7 @@ def _clarify_now() -> float:
     """Monotonic clock for the clarify-suppression window (tests monkeypatch this)."""
     return time.monotonic()
 
+
 # All write operations fail closed: each key must be explicitly enabled.
 # `update_projects` also covers project updates (status updates), milestones,
 # and initiatives — project-structure mutations share one umbrella key.
@@ -1001,9 +1002,7 @@ class LinearAgentAdapter(BasePlatformAdapter):
             raw_response=comment,
         )
 
-    async def _resolve_reply_session(
-        self, chat_id: str, metadata: dict[str, Any] | None = None
-    ) -> tuple[str, str]:
+    async def _resolve_reply_session(self, chat_id: str, metadata: dict[str, Any] | None = None) -> tuple[str, str]:
         """Resolve ``(agent_session_id, issue_id)`` for an outbound reply.
 
         Tries the in-memory per-issue map first, then recovers this app's
@@ -1058,7 +1057,7 @@ class LinearAgentAdapter(BasePlatformAdapter):
         if _clarify_now() - posted_at > CLARIFY_FALLBACK_SUPPRESS_SECONDS:
             registry.pop(key, None)  # stale: a later clarify may reuse the issue id
             return False
-        if not content[len(CLARIFY_FALLBACK_PREFIX):].startswith(question):
+        if not content[len(CLARIFY_FALLBACK_PREFIX) :].startswith(question):
             return False
         registry.pop(key, None)
         return True
@@ -1854,8 +1853,7 @@ class LinearAgentAdapter(BasePlatformAdapter):
         )
         await self._post_session_activity(
             context.agent_session_id,
-            f"Handoff limit reached: this issue already has {count} agent-to-agent handoffs. "
-            "Tom needs to step in.",
+            f"Handoff limit reached: this issue already has {count} agent-to-agent handoffs. Tom needs to step in.",
         )
         return {"status": "refused", "reason": "handoff limit reached", "handoffs": count}
 

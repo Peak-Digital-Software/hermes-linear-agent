@@ -37,7 +37,9 @@ from hermes_linear_agent.adapter import LinearAgentAdapter
 SESSION_KEY = "sk-clarify-fallback"
 ISSUE_ID = "issue-1"
 AGENT_SESSION_ID = "session-1"
-PICK = [{"qid": "q0", "question": "Which package should change?", "choices": ["frontend", "backend"], "multi_select": False}]
+PICK = [
+    {"qid": "q0", "question": "Which package should change?", "choices": ["frontend", "backend"], "multi_select": False}
+]
 
 
 class _RecordingLinearClient:
@@ -215,5 +217,3 @@ def test_answer_resolution_still_works_after_the_fallback_is_suppressed(loop, mo
 
     assert client.response_calls == []
     assert reply == {"answers": {"q0": expected}, "outcome": "submitted"}
-
-
