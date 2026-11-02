@@ -3,34 +3,49 @@
 Three paths, ported from peak-agent's bridge:
 
 * an Issue webhook whose state move cancels/completes the issue archives that
-  issue's open cards on every board;
-* a follower per board turns kanban card events into the issue's Linear status;
+  issue's open cards on every board, and wakes a parent session when a child
+  reaches Done;
+* a follower per board turns kanban card events into the issue's Linear status
+  and rolls the parent issue up from its children;
 * a reconcile pass re-derives every active issue's status from its whole card
   set, so a missed event heals on the next pass.
 
-Every Linear read and write goes through ``LinearClient.execute`` with the raw
-GraphQL queries below; the CLI plane is reached through ``kanban_cli`` (so tests
-can monkeypatch its module attributes).
+Board discovery and the per-board followers are event driven: ``watchfiles``
+watches the boards root and each board's database directory, so an idle
+gateway does no board reads at all. Every Linear read and write goes through
+``LinearClient.execute`` with the raw GraphQL queries below; the CLI plane is
+reached through ``kanban_cli`` (so tests can monkeypatch its module
+attributes).
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
+import sqlite3
+from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
+import watchfiles
+
 from . import kanban_cli
-from .kanban_rules import ACTED, CLOSED_TYPES, Card, is_open, issue_status, transition, with_blocked
+from .kanban_rules import ACTED, CLOSED_TYPES, Card, is_open, issue_status, rollup, transition
 
 logger = logging.getLogger(__name__)
 
-#: How often new boards are discovered.
-DISCOVERY_SECONDS = 60.0
+#: watchfiles reports a batch once the filesystem has been quiet this long.
+WATCH_DEBOUNCE_MS = 100
+#: watchfiles re-checks the inotify queue this often while it waits.
+WATCH_STEP_MS = 20
+
 #: How often a full reconcile pass runs.
 RECONCILE_SECONDS = 300.0
-#: How often an idle board follower polls its event table.
-POLL_SECONDS = 1.0
+
+#: The filesystem watcher; tests monkeypatch it to drive the loops by hand.
+_awatch = watchfiles.awatch
 
 #: A card's tenant is a Linear issue key, or it is not ours.
 ISSUE_KEY = re.compile(r"^[A-Z]+-\d+$")
@@ -45,6 +60,8 @@ ISSUE = """query Issue($id: String!) {
     identifier
     state { id name type }
     team { id key }
+    parent { id identifier }
+    children { nodes { id identifier state { name } } }
   }
 }"""
 
@@ -77,6 +94,8 @@ ACTIVE_ISSUES = """query ActiveIssues($team: String!, $after: String) {
       url
       state { id name type }
       team { id key }
+      parent { id identifier }
+      children { nodes { id identifier state { name } } }
       attachments(first: 10) { nodes { url sourceType metadata } }
     }
     pageInfo { hasNextPage endCursor }
@@ -114,6 +133,27 @@ def _routed(payload: dict[str, Any], flow: str) -> str:
     return f"route {key or '-'}: {flow}"
 
 
+def _nodes(value: object) -> list[dict[str, Any]]:
+    """The ``nodes`` list of a GraphQL connection, tolerating an empty answer."""
+    if not isinstance(value, dict):
+        return []
+    nodes = value.get("nodes")
+    if not isinstance(nodes, list):
+        return []
+    return [node for node in nodes if isinstance(node, dict)]
+
+
+def _db_filter(db_path: str) -> Callable[[Any, str], bool]:
+    """Keep only this board's database and its write-ahead log."""
+    name = os.path.basename(db_path)
+
+    def matches(_change: Any, path: str) -> bool:
+        found = os.path.basename(path)
+        return found == name or found == f"{name}-wal"
+
+    return matches
+
+
 class KanbanSync:
     """The webhook, follower and reconcile loops for one Linear workspace."""
 
@@ -122,23 +162,22 @@ class KanbanSync:
         client: Any,
         team_key: str = "ENG",
         *,
-        discovery_seconds: float = DISCOVERY_SECONDS,
+        wake: Callable[[str, str, str], None] | None = None,
+        boards_root: Path | None = None,
         reconcile_seconds: float = RECONCILE_SECONDS,
-        poll_seconds: float = POLL_SECONDS,
     ) -> None:
         self._client = client
         self.team_key = team_key
-        self.discovery_seconds = discovery_seconds
         self.reconcile_seconds = reconcile_seconds
-        self.poll_seconds = poll_seconds
+        self._wake = wake
+        self.boards_root = Path(boards_root) if boards_root is not None else Path.home() / ".hermes/kanban/boards"
 
         # state id -> workflow state type, resolved once per process
         self._state_types: dict[str, str | None] = {}
         # team id -> {state name: state id}, resolved once per process
         self._team_states: dict[str, dict[str, str]] = {}
 
-        self._started_boards: set[str] = set()
-        self._followers: list[asyncio.Task[None]] = []
+        self._followers: dict[str, asyncio.Task[None]] = {}
         self._discovery_task: asyncio.Task[None] | None = None
         self._reconcile_task: asyncio.Task[None] | None = None
 
@@ -151,64 +190,118 @@ class KanbanSync:
         return [self._discovery_task, self._reconcile_task]
 
     async def _discover_loop(self) -> None:
+        """Follow every board, re-listing them whenever the boards root changes."""
         try:
-            while True:
-                try:
-                    await self._poll_boards()
-                except asyncio.CancelledError:
-                    raise
-                except Exception as error:  # noqa: BLE001 - one line, then try again
-                    logger.warning("boards() failed: %s", _err_line(error))
-                await asyncio.sleep(self.discovery_seconds)
+            try:
+                self.boards_root.mkdir(parents=True, exist_ok=True)
+            except OSError as error:
+                logger.warning("boards root %s is unavailable: %s", self.boards_root, _err_line(error))
+                return
+            try:
+                await self._poll_boards()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # noqa: BLE001 - one line, then keep watching
+                logger.warning("boards() failed: %s", _err_line(error))
+            try:
+                async for _changes in _awatch(
+                    self.boards_root,
+                    recursive=False,
+                    debounce=WATCH_DEBOUNCE_MS,
+                    step=WATCH_STEP_MS,
+                ):
+                    try:
+                        await self._poll_boards()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as error:  # noqa: BLE001 - one line, then keep watching
+                        logger.warning("boards() failed: %s", _err_line(error))
+            except OSError as error:
+                # The boards root itself went away; there is nothing left to watch.
+                logger.warning("boards root %s: %s", self.boards_root, _err_line(error))
         finally:
             # The adapter only tracks start()'s tasks; followers live and die with discovery.
-            for follower in self._followers:
+            for follower in self._followers.values():
                 follower.cancel()
 
     async def _poll_boards(self) -> list[str]:
-        """Start one follower per board slug this process has not seen yet."""
+        """Start a follower per new board and cancel the ones that went away."""
         rows = await kanban_cli.boards()
-        fresh: list[str] = []
+        wanted: dict[str, str | None] = {}
         for row in rows:
             slug = row.get("slug")
-            if not slug or slug in self._started_boards:
+            if not slug or row.get("archived"):
                 continue
-            self._started_boards.add(slug)
-            self._followers.append(asyncio.create_task(self._follow_forever(slug, row.get("db_path"))))
+            wanted[slug] = row.get("db_path")
+
+        for slug, follower in list(self._followers.items()):
+            if slug in wanted and not follower.done():
+                continue
+            del self._followers[slug]
+            follower.cancel()
+
+        fresh: list[str] = []
+        for slug, db_path in wanted.items():
+            if slug in self._followers:
+                continue
+            self._followers[slug] = asyncio.create_task(self._follow_forever(slug, db_path))
             fresh.append(slug)
         return fresh
 
     # -- card events -> issue status ---------------------------------------
 
     async def _follow_forever(self, board: str, db_path: str | None) -> None:
-        while True:
-            try:
-                # _follow never returns, so a retry must resume from the persisted
-                # cursor, not the stale one it started with.
-                cursor = await self._seed_cursor(board, db_path)
-                await self._follow(board, db_path, cursor)
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:  # noqa: BLE001 - a follower never dies
-                logger.error("error: watch %s: %s", board, _err_line(error))
-                await asyncio.sleep(self.poll_seconds)
+        """One board's follower: seed the cursor, read, then react to changes."""
+        if not db_path:
+            return
+        try:
+            cursor = await self._seed_cursor(board, db_path)
+            await self._follow(board, db_path, cursor)
+        except asyncio.CancelledError:
+            raise
+        except FileNotFoundError:
+            # The board database or its directory vanished: nothing left to watch.
+            return
+        except Exception as error:  # noqa: BLE001 - one line, then this follower stops
+            logger.error("error: watch %s: %s", board, _err_line(error))
 
-    async def _seed_cursor(self, board: str, db_path: str | None) -> int:
+    async def _seed_cursor(self, board: str, db_path: str) -> int:
         """Resume from the saved cursor, or seed it from the newest event id."""
-        cursor = kanban_cli.load_cursor(board)
+        cursor = kanban_cli.load_cursor(board, db_path)
         if cursor is not None:
             return cursor
         cursor = await asyncio.to_thread(kanban_cli.max_event_id, db_path)
-        kanban_cli.save_cursor(board, cursor)
+        kanban_cli.save_cursor(board, db_path, cursor)
         return cursor
 
-    async def _follow(self, board: str, db_path: str | None, cursor: int) -> int:
-        """Follow one board's events until cancelled; returns the last cursor."""
+    async def _follow(self, board: str, db_path: str, cursor: int) -> int | None:
+        """Follow one board's events until the db goes away or the watch ends."""
+        folder = os.path.dirname(db_path) or "."
+        latest = await self._drain(board, db_path, cursor)
+        if latest is None:
+            return None
+        async for _changes in _awatch(
+            folder,
+            watch_filter=_db_filter(db_path),
+            debounce=WATCH_DEBOUNCE_MS,
+            step=WATCH_STEP_MS,
+        ):
+            latest = await self._drain(board, db_path, latest)
+            if latest is None:
+                return None
+        return latest
+
+    async def _drain(self, board: str, db_path: str, cursor: int) -> int | None:
+        """Handle every event after ``cursor``; ``None`` when the db is gone."""
         while True:
-            rows = await asyncio.to_thread(kanban_cli.read_events, db_path, cursor)
+            try:
+                rows = await asyncio.to_thread(kanban_cli.read_events, db_path, cursor)
+            except (FileNotFoundError, sqlite3.OperationalError) as error:
+                if isinstance(error, FileNotFoundError) or not os.path.exists(db_path):
+                    return None
+                raise
             if not rows:
-                await asyncio.sleep(self.poll_seconds)
-                continue
+                return cursor
             for row in rows:
                 try:
                     await self._handle_event(board, row)
@@ -217,7 +310,7 @@ class KanbanSync:
                 except Exception as error:  # noqa: BLE001 - one bad event, keep going
                     logger.error("error: watch %s %s: %s", board, row.get("task_id"), _err_line(error))
                 cursor = max(cursor, int(row.get("id", cursor)))
-                kanban_cli.save_cursor(board, cursor)
+                kanban_cli.save_cursor(board, db_path, cursor)
 
     async def _handle_event(self, board: str, row: dict[str, Any]) -> None:
         kind = row.get("kind")
@@ -230,34 +323,56 @@ class KanbanSync:
             return
 
         cards = await kanban_cli.cards(board, issue_key)
-        base = with_blocked(cards, issue_status(cards))
-        status = base
-        if base == "Done":
+        status = issue_status(cards)
+        if status == "Done":
             try:
-                status = with_blocked(cards, issue_status(cards, await self._attachments(issue_key)))
+                status = issue_status(cards, await self._attachments(issue_key))
             except asyncio.CancelledError:
                 raise
             except Exception as error:  # noqa: BLE001 - hold Done on the safe side
                 logger.warning(
-                    "warn: watch %s %s: attachments unavailable, holding %s in Reviewing: %s",
+                    "warn: watch %s %s: attachments unavailable, holding %s in Ready to Merge: %s",
                     board,
                     task_id,
                     issue_key,
                     _err_line(error),
                 )
-                status = with_blocked(cards, "Reviewing")
+                status = "Ready to Merge"
 
-        current = await self._current_status(issue_key)
-        closed = current.get("type") in CLOSED_TYPES
-        if closed or status is None or status == current.get("name"):
+        issue = await self._issue(issue_key)
+        current = issue.get("state") or {}
+        if current.get("type") in CLOSED_TYPES or status is None or status == current.get("name"):
             return
         logger.info("%s %s %s -> %s status %s", board, task_id, kind, issue_key, status)
         await self._set_status(issue_key, status)
+        await self._rollup_parent(issue, status)
 
-    async def _current_status(self, issue_key: str) -> dict[str, Any]:
-        issue = await self._issue(issue_key)
-        state = issue.get("state") or {}
-        return {"name": state.get("name"), "type": state.get("type")}
+    async def _rollup_parent(self, issue: dict[str, Any], status: str) -> None:
+        """Move the issue's parent to the rollup of its children, when it changes."""
+        parent = issue.get("parent") or {}
+        parent_id = parent.get("id")
+        if not parent_id:
+            return
+        node = await self._issue(str(parent_id))
+        if not node:
+            return
+
+        states: list[str] = []
+        for child in _nodes(node.get("children")):
+            if child.get("id") == issue.get("id"):
+                # The write just made may not be visible in this read yet.
+                states.append(status)
+            else:
+                states.append(str((child.get("state") or {}).get("name") or ""))
+
+        rolled = rollup(states)
+        if rolled is None:
+            return
+        current = node.get("state") or {}
+        if rolled == current.get("name"):
+            return
+        await self._set_status(str(parent_id), rolled)
+        logger.info("rollup %s: %s -> %s", parent.get("identifier") or parent_id, current.get("name"), rolled)
 
     # -- reconcile ---------------------------------------------------------
 
@@ -282,16 +397,21 @@ class KanbanSync:
             key = issue.get("identifier")
             if not key:
                 continue
-            cards: list[Card] = []
-            for row in rows:
-                slug = row.get("slug")
-                if slug:
-                    cards.extend(await kanban_cli.cards(slug, key))
-            if not cards:
-                continue
+            children = issue.get("children") or []
+            if children:
+                # A parent takes its children's rollup, never its own cards.
+                status = rollup([str((child.get("state") or {}).get("name") or "") for child in children])
+            else:
+                cards: list[Card] = []
+                for row in rows:
+                    slug = row.get("slug")
+                    if slug:
+                        cards.extend(await kanban_cli.cards(slug, key))
+                if not cards:
+                    continue
+                status = issue_status(cards, issue.get("attachments") or [])
 
             state = issue.get("state") or {}
-            status = with_blocked(cards, issue_status(cards, issue.get("attachments") or []))
             if status is None or status == state.get("name"):
                 continue
 
@@ -313,7 +433,7 @@ class KanbanSync:
 
         return changes
 
-    # -- Issue webhook -> archive cards ------------------------------------
+    # -- Issue webhook -> archive cards, wake a parent ----------------------
 
     async def handle_issue_webhook(self, payload: dict[str, Any]) -> str:
         """Route one verified webhook payload; returns the route result line."""
@@ -337,6 +457,9 @@ class KanbanSync:
             return _routed(payload, "ignored: no card action")
 
         key = data.get("identifier") or ""
+        if now_type == "completed":
+            await self._wake_parent(data, key)
+
         try:
             archived = await self._close_cards(key)
         except asyncio.CancelledError:
@@ -345,6 +468,23 @@ class KanbanSync:
             logger.error("error: %s %s: %s", card_action, key, _err_line(error))
             return f"error: {card_action} {key}: {_err_line(error)}"
         return _routed(payload, f"{card_action}: archived {archived}")
+
+    async def _wake_parent(self, data: dict[str, Any], key: str) -> None:
+        """Wake the parent session when a sub-issue reaches Done."""
+        parent_id = data.get("parentId")
+        if not parent_id or self._wake is None:
+            return
+        try:
+            found = data.get("parent")
+            parent = found if isinstance(found, dict) else {}
+            parent_key = str(parent.get("identifier") or "")
+            if not parent_key:
+                parent_key = str((await self._issue(str(parent_id))).get("identifier") or "")
+            self._wake(str(parent_id), parent_key, f"[sync] {key} is Done.")
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001 - a wake must not fail the webhook
+            logger.warning("warn: wake %s: %s", parent_id, _err_line(error))
 
     async def _close_cards(self, issue_key: str) -> int:
         """Archive every open card of the issue on every board (3 passes max)."""
@@ -451,6 +591,18 @@ def _normalize_issue(node: object) -> dict[str, Any] | None:
                     "metadata": link.get("metadata"),
                 }
             )
+    children = []
+    for child in _nodes(node.get("children")):
+        if not child.get("id"):
+            continue
+        children.append(
+            {
+                "id": child["id"],
+                "identifier": child.get("identifier") or "",
+                "state": {"name": (child.get("state") or {}).get("name") or ""},
+            }
+        )
+    parent = node.get("parent") if isinstance(node.get("parent"), dict) else {}
     state = node.get("state") or {}
     team = node.get("team") or {}
     return {
@@ -465,5 +617,7 @@ def _normalize_issue(node: object) -> dict[str, Any] | None:
             "type": state.get("type") or "",
         },
         "team": {"id": team.get("id") or "", "key": team.get("key") or ""},
+        "parent": {"id": parent.get("id") or "", "identifier": parent.get("identifier") or ""} if parent else None,
+        "children": children,
         "attachments": attachments,
     }
