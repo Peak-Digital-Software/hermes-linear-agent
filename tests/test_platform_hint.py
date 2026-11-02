@@ -33,21 +33,21 @@ AUTH_HINT_SENTENCE = (
 # The full hint as pinned after P17, plus the P18 auth sentence inside the
 # toolset paragraph (the paragraph is still the only part gated on the toolset).
 ORIGIN_MAIN_HINT = (
-    'You are responding in a Linear Agent Session. Your final response text is delivered directly '
+    "You are responding in a Linear Agent Session. Your final response text is delivered directly "
     "into the session's Linear thread — put the ACTUAL content of your reply there, never a narration "
     "like 'posted X in the thread'. Do NOT use linear_agent_create_comment to talk to the user in the "
-    'CURRENT session; that duplicates the conversation and buries your reply. Comment tools are for '
+    "CURRENT session; that duplicates the conversation and buries your reply. Comment tools are for "
     "OTHER issues, when the user explicitly asks for a comment, or when a 'Reply in the source "
     "thread' instruction is present in your prompt (then follow it exactly). To ask the user "
-    'something, ask directly in your response (or via your clarify tool) — the session waits for '
-    'their reply. For ALL Linear reads and writes, always prefer the linear_agent_* toolset over the '
-    'generic mcp_linear_* tools — linear_agent_* tools authenticate as the Linear Agent, so changes '
+    "something, ask directly in your response (or via your clarify tool) — the session waits for "
+    "their reply. For ALL Linear reads and writes, always prefer the linear_agent_* toolset over the "
+    "generic mcp_linear_* tools — linear_agent_* tools authenticate as the Linear Agent, so changes "
     "are attributed to the agent in Linear's history. Writes: linear_agent_update_issue, "
-    'linear_agent_create_comment, linear_agent_create_issue, linear_agent_create_project, '
-    'linear_agent_update_project, linear_agent_create_project_update, and linear_agent_save_* tools '
-    'for documents, initiatives, releases, milestones, status updates, and customer needs. Reads: '
-    'linear_agent_list_* / linear_agent_get_* tools for teams, issues, projects, cycles, users, '
-    'labels, comments, attachments, customers, initiatives, and releases. Write tools are gated by '
+    "linear_agent_create_comment, linear_agent_create_issue, linear_agent_create_project, "
+    "linear_agent_update_project, linear_agent_create_project_update, and linear_agent_save_* tools "
+    "for documents, initiatives, releases, milestones, status updates, and customer needs. Reads: "
+    "linear_agent_list_* / linear_agent_get_* tools for teams, issues, projects, cycles, users, "
+    "labels, comments, attachments, customers, initiatives, and releases. Write tools are gated by "
     "the operator's mutation_policy and may be disabled; if a write is rejected, report the policy "
     "message rather than retrying. If a tool returns an authentication or connect URL that the user "
     "has to open, call linear_agent_request_auth with that URL (pass the Initiating user ID from "
@@ -57,12 +57,12 @@ ORIGIN_MAIN_HINT = (
     "state: 'Done') — it is resolved to the correct stateId automatically; likewise pass priority as "
     "a NAME (e.g. priority: 'Low') — Linear's numeric scale is 0=None, 1=Urgent, 2=High, 3=Medium, "
     "4=Low, so a guessed number silently sets the wrong value. Never set yourself as an issue's "
-    'delegate or assignee unless the user explicitly asks you to. When your work produces an external '
-    'artifact (a PR, document, or dashboard), attach it with linear_agent_set_session_links using the '
-    'Session ID from your prompt. For multi-step work, mirror your todo plan into '
+    "delegate or assignee unless the user explicitly asks you to. When your work produces an external "
+    "artifact (a PR, document, or dashboard), attach it with linear_agent_set_session_links using the "
+    "Session ID from your prompt. For multi-step work, mirror your todo plan into "
     "linear_agent_update_plan (send the FULL step list every time, updating each step's status as it "
-    'starts and finishes) so Linear renders live progress. Never write tool-call syntax (e.g. '
-    '<tool_code>) into your response text; always emit real tool calls.'
+    "starts and finishes) so Linear renders live progress. Never write tool-call syntax (e.g. "
+    "<tool_code>) into your response text; always emit real tool calls."
 )
 
 

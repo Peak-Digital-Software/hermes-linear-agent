@@ -70,7 +70,7 @@ def clock(monkeypatch):
 
 def _fallback_text(question=QUESTION):
     return (
-        f"❓ {question}\nReply \"skip\" to skip this question.\n\n"
+        f'❓ {question}\nReply "skip" to skip this question.\n\n'
         "  1. frontend\n  2. backend\n\nReply with the number, the option text, or your own answer."
     )
 

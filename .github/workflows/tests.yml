@@ -44,3 +44,10 @@ jobs:
       - run: ruff format --check hermes_linear_agent tests scripts __init__.py
       - run: python -m compileall -q hermes_linear_agent tests scripts __init__.py
       - run: python -m build
+
+  # The org ruleset "ci green before merge" requires a check named `ci`.
+  ci:
+    needs: [hermes-compatibility, package-quality]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok

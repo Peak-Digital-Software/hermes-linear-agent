@@ -12,7 +12,7 @@ import re
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 from utils import is_truthy_value as _boolish
@@ -67,6 +67,9 @@ from .webhook import (
     verify_linear_signature,
 )
 
+if TYPE_CHECKING:  # pragma: no cover - typing only; the import is lazy at runtime
+    from .kanban_sync import KanbanSync
+
 logger = logging.getLogger(__name__)
 
 # Loopback by default: the webhook listener is reachable from the public
@@ -82,6 +85,10 @@ DEFAULT_ACK_BODY = "I’m starting work on this."
 # service (peak-agent), authorized by an HMAC over the raw body — never by the
 # user allowlist — so it must not be reachable through the public webhook URL.
 DEFAULT_WAKE_PATH = "/internal/wake"
+# Issue-data webhooks drive the optional kanban ⇄ Linear sync. A separate path
+# (and a separate secret) keeps them away from agent-session dispatch, its
+# sender allowlist and its auto-start behavior. No /p/<profile> variant.
+ISSUE_WEBHOOK_PATH = "/hermes/linear-issues"
 WAKE_MAX_SKEW_SECONDS = 300
 WAKE_TEXT_PREFIX = "[peak-agent wake] "
 # Agent-to-agent handoff cap. A peer session is accepted only while the issue
@@ -105,6 +112,7 @@ CLARIFY_FALLBACK_SUPPRESS_SECONDS = 10.0
 def _clarify_now() -> float:
     """Monotonic clock for the clarify-suppression window (tests monkeypatch this)."""
     return time.monotonic()
+
 
 # All write operations fail closed: each key must be explicitly enabled.
 # `update_projects` also covers project updates (status updates), milestones,
@@ -164,6 +172,18 @@ def _bool_opt(extra: dict[str, Any], key: str, env_name: str, default: bool) -> 
     if value is None:
         value = _str_env(env_name) or None
     return _boolish(value, default)
+
+
+def _kanban_sync_class():
+    """Import ``KanbanSync`` on first use.
+
+    Deferred so the sync module (and its CLI/DB imports) is never loaded on
+    installs that leave ``kanban_sync`` off, and so a missing module only
+    matters when the flag is on.
+    """
+    from .kanban_sync import KanbanSync
+
+    return KanbanSync
 
 
 def _floatish(value: Any, default: float = 0.0) -> float:
@@ -459,6 +479,8 @@ def _apply_yaml_config(yaml_cfg: dict, platform_cfg: dict) -> dict[str, Any] | N
         "env_path",
         "auth_path",
         "max_body_bytes",
+        "kanban_sync",
+        "issue_webhook_secret",
     ):
         if key in platform_cfg:
             seed[key] = platform_cfg[key]
@@ -613,6 +635,15 @@ class LinearAgentAdapter(BasePlatformAdapter):
         self._mutation_policy = _merge_policy(extra.get("mutation_policy"))
         self._auto_skills = _list_value(extra.get("auto_skills"))
         self._max_body_bytes = int(extra.get("max_body_bytes") or 1_048_576)
+        # Optional kanban ⇄ Linear sync (ENG-2274). Off unless an adapter
+        # explicitly opts in; the issue webhook uses its own secret so
+        # agent-session traffic and issue data never share an authorization
+        # path. Unset issue secret = the route fails closed (401).
+        self._kanban_sync = _bool_opt(extra, "kanban_sync", "LINEAR_AGENT_KANBAN_SYNC", False)
+        self._issue_webhook_secret = str(
+            extra.get("issue_webhook_secret") or _str_env("LINEAR_ISSUE_WEBHOOK_SECRET") or ""
+        ).strip()
+        self._kanban: KanbanSync | None = None
         self._oauth_manager = _build_oauth_manager(extra, self._access_token)
         self._client = client or _build_client(extra, self._access_token, self._oauth_manager)
         self._runner = None
@@ -645,6 +676,11 @@ class LinearAgentAdapter(BasePlatformAdapter):
         app.router.add_post(DEFAULT_WAKE_PATH, self._handle_wake)
         app.router.add_post(self._webhook_path, self._handle_webhook)
         app.router.add_post(f"/p/{{profile}}{self._webhook_path}", self._handle_webhook)
+        if self._kanban_sync:
+            # Deliberately root-level and without a /p/<profile> mirror: issue
+            # data webhooks carry their own secret and must never share the
+            # agent-session route's authorization or dispatch path.
+            app.router.add_post(ISSUE_WEBHOOK_PATH, self._handle_issue_webhook)
         return app
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
@@ -684,6 +720,8 @@ class LinearAgentAdapter(BasePlatformAdapter):
         bind_pooled_loop = getattr(self._client, "bind_pooled_loop", None)
         if bind_pooled_loop is not None:
             bind_pooled_loop()
+        if self._kanban_sync:
+            self._start_kanban_sync()
         self._mark_connected()
         logger.info(
             "[linear_agent] Listening on %s:%d%s",
@@ -737,6 +775,10 @@ class LinearAgentAdapter(BasePlatformAdapter):
         return ""
 
     async def disconnect(self) -> None:
+        # First: stop the sync loops (and any in-flight turn) so a reconnect
+        # never orphans a follower against the same cursor/DB.
+        await self.cancel_background_tasks()
+        self._kanban = None
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
@@ -750,6 +792,78 @@ class LinearAgentAdapter(BasePlatformAdapter):
         self._mark_disconnected()
         set_active_adapter(None)
         logger.info("[linear_agent] Disconnected")
+
+    # ------------------------------------------------------------------
+    # Optional kanban ⇄ Linear sync (ENG-2274)
+    # ------------------------------------------------------------------
+
+    def _start_kanban_sync(self) -> None:
+        """Start the sync loops and track them with the adapter's tasks.
+
+        Only called from ``connect`` when ``kanban_sync`` is on; the import is
+        deferred so a flag-off adapter never loads the sync module.
+        """
+        sync_cls = _kanban_sync_class()
+        sync = sync_cls(self._client)
+        self._kanban = sync
+        for task in sync.start():
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+        logger.info("[linear_agent] Kanban sync started")
+
+    async def _handle_issue_webhook(self, request: web.Request) -> web.Response:
+        """Accept one Linear Issue data webhook for the kanban sync.
+
+        Order matters: body cap (413), then the issue secret (401, failing
+        closed when unset) BEFORE the body is parsed, then the replay guard.
+        The reply is sent before the sync work runs, and this path never
+        touches agent-session dispatch, dedup, sender authorization or
+        auto-start.
+        """
+        content_length = request.content_length or 0
+        if content_length > self._max_body_bytes:
+            return web.json_response({"error": "Payload too large"}, status=413)
+        raw_body = await request.read()
+        if len(raw_body) > self._max_body_bytes:
+            return web.json_response({"error": "Payload too large"}, status=413)
+
+        if not verify_linear_signature(request.headers, raw_body, self._issue_webhook_secret):
+            logger.warning(
+                "[linear_agent] Invalid issue webhook signature; signature_headers=%s",
+                describe_signature_headers(request.headers),
+            )
+            return web.json_response({"error": "Invalid signature"}, status=401)
+
+        try:
+            payload = parse_json_body(raw_body)
+        except LinearWebhookError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+
+        if is_stale_body_timestamp(payload, request.headers):
+            logger.warning("[linear_agent] Rejecting stale issue webhook delivery (replay guard)")
+            return web.json_response({"error": "Stale webhook delivery"}, status=400)
+
+        self._dispatch_issue_webhook(payload)
+        return web.json_response({"status": "accepted"}, status=200)
+
+    def _dispatch_issue_webhook(self, payload: dict[str, Any]) -> None:
+        """Queue the sync handling; the HTTP caller answers 200 immediately."""
+        sync = self._kanban
+        if sync is None:
+            # The route can be hit before connect in tests or during a
+            # reconnect; ack and drop rather than 500 or dispatch.
+            logger.debug("[linear_agent] Issue webhook received with no kanban sync; skipping")
+            return
+        task = asyncio.create_task(self._run_issue_webhook(sync, payload))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _run_issue_webhook(self, sync: KanbanSync, payload: dict[str, Any]) -> None:
+        try:
+            result = await sync.handle_issue_webhook(payload)
+            logger.info("[linear_agent] Issue webhook handled: %s", result)
+        except Exception:  # noqa: BLE001 - background task must never raise into the loop
+            logger.exception("[linear_agent] Issue webhook handling failed")
 
     async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
         return {"name": chat_id, "type": "linear_agent_session"}
@@ -888,9 +1002,7 @@ class LinearAgentAdapter(BasePlatformAdapter):
             raw_response=comment,
         )
 
-    async def _resolve_reply_session(
-        self, chat_id: str, metadata: dict[str, Any] | None = None
-    ) -> tuple[str, str]:
+    async def _resolve_reply_session(self, chat_id: str, metadata: dict[str, Any] | None = None) -> tuple[str, str]:
         """Resolve ``(agent_session_id, issue_id)`` for an outbound reply.
 
         Tries the in-memory per-issue map first, then recovers this app's
@@ -945,7 +1057,7 @@ class LinearAgentAdapter(BasePlatformAdapter):
         if _clarify_now() - posted_at > CLARIFY_FALLBACK_SUPPRESS_SECONDS:
             registry.pop(key, None)  # stale: a later clarify may reuse the issue id
             return False
-        if not content[len(CLARIFY_FALLBACK_PREFIX):].startswith(question):
+        if not content[len(CLARIFY_FALLBACK_PREFIX) :].startswith(question):
             return False
         registry.pop(key, None)
         return True
@@ -1741,8 +1853,7 @@ class LinearAgentAdapter(BasePlatformAdapter):
         )
         await self._post_session_activity(
             context.agent_session_id,
-            f"Handoff limit reached: this issue already has {count} agent-to-agent handoffs. "
-            "Tom needs to step in.",
+            f"Handoff limit reached: this issue already has {count} agent-to-agent handoffs. Tom needs to step in.",
         )
         return {"status": "refused", "reason": "handoff limit reached", "handoffs": count}
 
