@@ -108,6 +108,14 @@ CLARIFY_FALLBACK_PREFIX = "\u2753 "
 # How recent the elicitation must be for the fallback to count as a duplicate of
 # it. Core's fallback fires immediately after the failed disposition, so seconds.
 CLARIFY_FALLBACK_SUPPRESS_SECONDS = 10.0
+# ── Kanban notifier pings ─────────────────────────────────────────────────────
+# A `notify+wake` subscription sends a passive ping ("✔ [board] @coder Kanban
+# t_x done — …", i18n key `gateway.kanban.ping.*`, head `gateway.kanban.ping.head`)
+# through `send()` just before the wake turn starts. Posted as a `response` it
+# makes Linear mark the session complete while the agent is starting work; as a
+# non-ephemeral `thought` it stays in the timeline and the session stays active.
+# The head starts with a status glyph, so a reply like "Reviewed Kanban t_x" is not a ping.
+KANBAN_PING_RE = re.compile(r"^[^\w\s]+ (?:\[[^\]]+\] )?(?:@\S+ )?Kanban t_[0-9a-f]+\b")
 
 
 def _clarify_now() -> float:
@@ -1100,6 +1108,13 @@ class LinearAgentAdapter(BasePlatformAdapter):
             )
             return await self._send_issue_comment(issue_id, content)
         activity: dict[str, Any] = {}
+        if KANBAN_PING_RE.match(content):
+            try:
+                activity = await self._client.create_thought(agent_session_id, content[: self.MAX_MESSAGE_LENGTH])
+            except Exception as exc:  # noqa: BLE001 - adapter boundary returns SendResult
+                logger.warning("[linear_agent] Failed to create kanban thought activity: %s", exc)
+                return SendResult(success=False, error=str(exc))
+            return SendResult(success=True, message_id=str(activity.get("id") or "") or None)
         chunks = _split_message(content, self.MAX_MESSAGE_LENGTH)
         try:
             # Nothing upstream chunks the non-streaming path, so oversized
