@@ -1839,6 +1839,29 @@ async def test_send_chunks_oversized_responses():
     assert "paragraph 599" in rejoined
 
 
+async def test_send_posts_kanban_pings_as_thoughts_so_the_session_stays_active():
+    """A kanban notifier ping precedes the wake turn; as a `response` it would mark
+    the Linear session complete while the agent starts working."""
+    fake_client = _FakeLinearClient()
+    adapter = _make_adapter(client=fake_client)
+    adapter._latest_agent_session["issue-1"] = "session-1"
+
+    for ping in (
+        "\u23f8 [engineering] @coder Kanban t_06b81f17 blocked: workflow push",
+        "\u2714 [engineering] @coder Kanban t_d3fdc7fb done \u2014 ENG-2289 W1",
+        "\U0001f6d1 [engineering] Kanban t_06b81f17 review requested changes/BLOCK: x",
+    ):
+        result = await adapter.send("issue-1", ping, metadata={})
+        assert result.success is True
+
+    assert [c[0] for c in fake_client.calls] == ["thought", "thought", "thought"]
+    assert fake_client.thought_ephemeral_flags == [False, False, False]
+
+    # The agent's own reply mentioning a card is still a response.
+    await adapter.send("issue-1", "Kanban t_06b81f17 is unblocked.", metadata={})
+    assert fake_client.calls[-1][0] == "response"
+
+
 def test_guidance_list_renders_rule_bodies():
     """Linear sends guidance as [{body, origin}] — the prompt must carry the
     rule text, never a stringified dict."""
