@@ -1,0 +1,12 @@
+{
+  "task": {
+    "id": "t_ffda41d3",
+    "title": "ENG-2274 W1: kanban_rules.py (pure status rules)",
+    "tenant": "ENG-2274",
+    "status": "running",
+    "assignee": "coder",
+    "completed_at": null
+  },
+  "parents": [],
+  "children": ["t_7e3e1711"]
+}

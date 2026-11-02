@@ -1,0 +1,34 @@
+[
+  {
+    "id": "t_ffda41d3",
+    "title": "ENG-2274 W1: kanban_rules.py (pure status rules)",
+    "tenant": "ENG-2274",
+    "status": "running",
+    "assignee": "coder",
+    "completed_at": null
+  },
+  {
+    "id": "t_7e3e1711",
+    "title": "ENG-2274 W2: kanban_cli.py (CLI calls, event follower, cursor)",
+    "tenant": "ENG-2274",
+    "status": "running",
+    "assignee": "coder",
+    "completed_at": null
+  },
+  {
+    "id": "t_d3e6fd4d",
+    "title": "ENG-2274 W3: kanban_sync.py (reconcile + webhook routing)",
+    "tenant": "ENG-2274",
+    "status": "running",
+    "assignee": "coder",
+    "completed_at": null
+  },
+  {
+    "id": "t_3c662731",
+    "title": "ENG-2274 W4: adapter.py wiring",
+    "tenant": "ENG-2274",
+    "status": "ready",
+    "assignee": "coder",
+    "completed_at": null
+  }
+]
