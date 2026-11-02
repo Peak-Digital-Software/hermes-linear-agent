@@ -772,6 +772,18 @@ async def test_a_parent_already_at_the_rollup_is_not_rewritten(boards):
     assert client.updates == [{"id": "issue-ENG-3", "stateId": "s-working"}]
 
 
+async def test_an_event_on_an_issue_with_children_writes_the_rollup_not_its_cards(boards):
+    client = FakeClient(current={"ENG-1": "Working"})
+    client.children["ENG-1"] = [child_node("ENG-2", "Working")]
+    sync = KanbanSync(client)
+    boards.shows["t_1"] = {"id": "t_1", "tenant": "ENG-1", "completed": False}
+    boards.cards_by[(BOARD, "ENG-1")] = [card("t_1", "review", "oracle")]
+
+    await sync._handle_event(BOARD, event(1, "t_1", "claimed"))
+
+    assert client.updates == []
+
+
 async def test_a_work_issue_without_a_parent_never_fetches_one(boards):
     client = FakeClient(current={"ENG-3": "Todo"})
     sync = KanbanSync(client)

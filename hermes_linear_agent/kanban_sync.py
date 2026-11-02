@@ -340,6 +340,10 @@ class KanbanSync:
                 status = "Ready to Merge"
 
         issue = await self._issue(issue_key)
+        children = _nodes(issue.get("children"))
+        if children:
+            # An issue with sub-issues takes their rollup, never its own cards.
+            status = rollup([str((child.get("state") or {}).get("name") or "") for child in children])
         current = issue.get("state") or {}
         if current.get("type") in CLOSED_TYPES or status is None or status == current.get("name"):
             return
