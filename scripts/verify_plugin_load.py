@@ -9,7 +9,7 @@ from gateway.platform_registry import platform_registry
 from hermes_cli.plugins import get_plugin_manager
 from tools.registry import registry
 
-EXPECTED_TOOLS = 58
+EXPECTED_TOOLS = 59
 SMOKE_TOOLS = (
     "linear_agent_update_issue",
     "linear_agent_create_comment",
