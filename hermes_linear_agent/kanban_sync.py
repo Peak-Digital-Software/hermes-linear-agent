@@ -280,8 +280,10 @@ class KanbanSync:
         latest = await self._drain(board, db_path, cursor)
         if latest is None:
             return None
+        # recursive=False: the default board's db is ~/.hermes/kanban.db, so its folder is all of ~/.hermes.
         async for _changes in _awatch(
             folder,
+            recursive=False,
             watch_filter=_db_filter(db_path),
             debounce=WATCH_DEBOUNCE_MS,
             step=WATCH_STEP_MS,
