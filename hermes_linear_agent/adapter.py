@@ -64,6 +64,7 @@ from .webhook import (
     is_stale_body_timestamp,
     normalize_action,
     parse_json_body,
+    unblocked_issue,
     verify_linear_signature,
 )
 
@@ -804,7 +805,9 @@ class LinearAgentAdapter(BasePlatformAdapter):
         deferred so a flag-off adapter never loads the sync module.
         """
         sync_cls = _kanban_sync_class()
-        sync = sync_cls(self._client)
+        # The sync wakes sessions through this adapter's dispatcher: a wake is
+        # a real turn on the issue's Hermes session, not a webhook delivery.
+        sync = sync_cls(self._client, wake=self._dispatch_wake)
         self._kanban = sync
         for task in sync.start():
             self._background_tasks.add(task)
@@ -1444,6 +1447,54 @@ class LinearAgentAdapter(BasePlatformAdapter):
         except Exception:  # noqa: BLE001 - background task must never raise into the loop
             logger.exception("[linear_agent] Wake turn failed for %s", event.source.chat_id)
 
+    async def _route_issue_unblocked(self, issue_id: str, identifier: str) -> tuple[dict[str, Any], int]:
+        """Wake the issue (or its parent) when it unblocks under our delegation.
+
+        Only a delegation this app holds is actionable: on the issue itself,
+        or on the parent when the unblocked issue is a sub-issue (the parent
+        session owns the children). The wake text names the unblocked issue's
+        key either way. A failed fetch is logged and acknowledged with 200,
+        because Linear retries (and eventually disables) a webhook that answers
+        non-2xx.
+        """
+        key = identifier or issue_id
+        try:
+            issue = await self._client.get_issue(id=issue_id)
+        except Exception as exc:  # noqa: BLE001 - an unblocked wake is best-effort
+            logger.warning(
+                "[linear_agent] issueUnblocked: could not fetch issue %s (%s); ignoring",
+                issue_id,
+                exc,
+            )
+            return {"status": "ignored", "reason": "lookup failed"}, 200
+        if not isinstance(issue, dict):
+            logger.info("[linear_agent] issueUnblocked: issue %s not found; ignoring", issue_id)
+            return {"status": "ignored", "reason": "issue not found"}, 200
+
+        app_user_id = str(self._app_user_id or "").strip()
+        text = f"[sync] {key} unblocked."
+        delegate_id = str(((issue.get("delegate") or {}).get("id")) or "").strip()
+        if app_user_id and delegate_id == app_user_id:
+            self._dispatch_wake(issue_id, key, text)
+            logger.info("[linear_agent] Woke issue %s after issueUnblocked", key)
+            return {"status": "woken", "issue": key}, 200
+
+        parent_raw = issue.get("parent")
+        parent = parent_raw if isinstance(parent_raw, dict) else {}
+        parent_id = str(parent.get("id") or "").strip()
+        parent_delegate_id = str(((parent.get("delegate") or {}).get("id")) or "").strip()
+        if app_user_id and parent_id and parent_delegate_id == app_user_id:
+            parent_key = str(parent.get("identifier") or "").strip() or parent_id
+            self._dispatch_wake(parent_id, parent_key, text)
+            logger.info("[linear_agent] Woke parent %s after issueUnblocked on %s", parent_key, key)
+            return {"status": "woken", "issue": parent_key}, 200
+
+        logger.info(
+            "[linear_agent] issueUnblocked for %s ignored: not delegated to this app",
+            key,
+        )
+        return {"status": "ignored", "reason": "not delegated to this app"}, 200
+
     async def handle_webhook(
         self,
         headers: dict[str, str],
@@ -1496,6 +1547,14 @@ class LinearAgentAdapter(BasePlatformAdapter):
         perm_event = self._permission_change_event(payload)
         if perm_event:
             return {"status": "ignored", "reason": perm_event}, 200
+
+        # An issueUnblocked app-user notification has no agentSession and no
+        # Issue data change, so the SUPPORTED_ACTIONS filter below would drop
+        # it. It is the sync's cue to wake the delegated issue (or its
+        # delegated parent), so route it before that filter.
+        unblocked = unblocked_issue(payload)
+        if unblocked is not None:
+            return await self._route_issue_unblocked(*unblocked)
 
         # Filter unsupported deliveries BEFORE strict context extraction: with
         # extra webhook categories enabled Linear sends data-change events
@@ -1791,9 +1850,28 @@ class LinearAgentAdapter(BasePlatformAdapter):
                     exc,
                 )
                 return "", ""
-        if not creator_id or creator_id == self._app_user_id:
+        if not creator_id:
             return "", ""
-        return creator_id, "issue.creatorId"
+        if not self._app_user_id or creator_id != self._app_user_id:
+            return creator_id, "issue.creatorId"
+        # The creator is this app (an issue the agent filed or an app-created
+        # delegation): our own id is never a sender. The assignee is the human
+        # the work is for, so fall back to it — the allowlist still decides.
+        try:
+            issue = await self._client.get_issue(id=issue_id)
+        except Exception as exc:  # noqa: BLE001 - unresolved sender must stay unauthorized
+            logger.warning(
+                "[linear_agent] Could not resolve the assignee of issue %s for session %s: %s",
+                issue_id,
+                context.agent_session_id,
+                exc,
+            )
+            return "", ""
+        assignee = issue.get("assignee") if isinstance(issue, dict) else None
+        assignee_id = str(((assignee or {}).get("id")) or "").strip()
+        if not assignee_id:
+            return "", ""
+        return assignee_id, "issue_assignee"
 
     def _is_peer_sender(self, context: LinearWebhookContext) -> bool:
         """True when the sender is a listed peer app (and not ourselves)."""

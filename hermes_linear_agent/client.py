@@ -857,6 +857,7 @@ mutation AgentSessionUpdate($id: String!, $input: AgentSessionUpdateInput!) {
           issue(id: $id) {
             id identifier title description state { id name type } assignee { id name } team { id key name }
             delegate { id } priority project { id name } dueDate createdAt updatedAt
+            parent { id identifier delegate { id } }
           }
         }
         """

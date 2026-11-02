@@ -29,6 +29,7 @@ from test_linear_agent_adapter import (
 from hermes_linear_agent.client import LinearApiError, LinearGraphQLClient
 from hermes_linear_agent.webhook import (
     is_stale_body_timestamp,
+    unblocked_issue,
     verify_linear_signature,
 )
 
@@ -243,3 +244,61 @@ def test_sender_is_read_from_linear_agent_session_event_shape():
     }
     ctx = extract_context(created, {})
     assert ctx.actor_user_id == "tom-1"
+
+
+# ---------------------------------------------------------------------------
+# issueUnblocked: the AppUserNotification shape carries an issue id, not an
+# agentSession, so it is recognized explicitly before context extraction
+# ---------------------------------------------------------------------------
+
+
+def _unblocked_payload(**notification) -> dict:
+    payload = {
+        "id": "evt-unblocked",
+        "type": "AppUserNotification",
+        "action": "issueUnblocked",
+        "notification": {
+            "type": "issueUnblocked",
+            "userId": "user-1",
+            "actorId": "user-2",
+            "issueId": "issue-1",
+            "issue": {"identifier": "ENG-2263"},
+        },
+    }
+    payload["notification"].update(notification)
+    return payload
+
+
+def test_unblocked_issue_reads_the_live_app_user_notification_shape():
+    assert unblocked_issue(_unblocked_payload()) == ("issue-1", "ENG-2263")
+
+
+def test_unblocked_issue_falls_back_to_the_nested_issue_id():
+    payload = _unblocked_payload()
+    del payload["notification"]["issueId"]
+    payload["notification"]["issue"] = {"id": "issue-2", "identifier": "ENG-2264"}
+
+    assert unblocked_issue(payload) == ("issue-2", "ENG-2264")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        # Ordinary Issue data webhook.
+        {"type": "Issue", "action": "update", "data": {"id": "issue-1"}},
+        # An AppUserNotification for a different notification type.
+        {"type": "AppUserNotification", "action": "issueMention", "notification": {"issueId": "issue-1"}},
+        # Right action, but the type does not say AppUserNotification.
+        {"action": "issueUnblocked", "notification": {"issueId": "issue-1"}},
+        # Right type and action, but no issue id anywhere.
+        {
+            "type": "AppUserNotification",
+            "action": "issueUnblocked",
+            "notification": {"issue": {"identifier": "ENG-2263"}},
+        },
+        # Garbage.
+        {"type": "AppUserNotification", "action": "issueUnblocked", "notification": "nope"},
+    ],
+)
+def test_unblocked_issue_ignores_any_other_shape(payload):
+    assert unblocked_issue(payload) is None

@@ -38,8 +38,17 @@ class _FakeLinearClient:
         self.comment_users = {}
         # issue id -> creator id (P14 sender fallback)
         self.issue_creators = {}
+        # issue id -> issue node (assignee fallback, issueUnblocked routing)
+        self.issues = {}
         self.agent_sessions_error = None
         self.issue_creator_error = None
+        self.issue_error = None
+
+    async def get_issue(self, id):
+        self.calls.append(("get_issue", id))
+        if self.issue_error:
+            raise self.issue_error
+        return self.issues.get(id)
 
     async def list_issue_agent_sessions(self, issue_id, limit=50):
         if self.agent_sessions_error:
@@ -910,11 +919,42 @@ async def test_rule_delegated_session_refuses_an_unknown_issue_creator():
 
 
 @pytest.mark.asyncio
-async def test_rule_delegated_session_refuses_when_the_issue_creator_is_this_app():
+async def test_app_created_delegated_issue_takes_its_sender_from_the_assignee():
+    """An issue this app created (automation rule / app delegation) names the
+    app as its creator, which is not a sender. The assignee is the human the
+    work is for, so the session starts with that user as its sender — subject
+    to the very same allowlist."""
     client = _FakeLinearClient()
     client.issue_creators["issue-1"] = "app-1"
-    # Even "allow every user" must not accept our own app as the sender.
-    adapter = _rule_adapter(client, allow_all_users=True, allowed_users=["app-1"])
+    client.issues["issue-1"] = {"id": "issue-1", "assignee": {"id": "tom-1", "name": "Tom"}}
+    adapter = _rule_adapter(client, allowed_users=["tom-1"])
+    events = await _capture_events(adapter)
+
+    _, status = await _post(adapter, _rule_delegated_payload(), delivery_id="evt-rule")
+    await _settle()
+
+    assert status == 200
+    assert [event.source.user_id for event in events] == ["tom-1"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("assignee", "allow_all"),
+    [
+        # No assignee at all: still no sender, even under allow_all_users.
+        (None, True),
+        # An assignee the allowlist does not grant.
+        ({"id": "stranger-9", "name": "Stranger"}, False),
+    ],
+)
+async def test_app_created_issue_without_an_allowlisted_assignee_still_refuses(assignee, allow_all):
+    client = _FakeLinearClient()
+    client.issue_creators["issue-1"] = "app-1"
+    issue = {"id": "issue-1"}
+    if assignee:
+        issue["assignee"] = assignee
+    client.issues["issue-1"] = issue
+    adapter = _rule_adapter(client, allow_all_users=allow_all, allowed_users=["tom-1"])
     events = await _capture_events(adapter)
 
     _, status = await _post(adapter, _rule_delegated_payload(), delivery_id="evt-rule")
@@ -1086,3 +1126,127 @@ async def test_clarify_falls_back_to_the_base_text_path_when_there_is_no_session
     assert client.activities == []
     assert [call[0] for call in client.calls] == ["comment"]
     assert client.calls[0][1] == "issue-1"
+
+
+# ---------------------------------------------------------------------------
+# issueUnblocked: a blocked issue that unblocks is a fresh chance to work, but
+# only where this app holds the delegation (on the issue or on its parent).
+# ---------------------------------------------------------------------------
+
+
+def _unblocked_app_payload(*, issue_id="issue-1", identifier="ENG-2263"):
+    return {
+        "id": "evt-unblocked",
+        "type": "AppUserNotification",
+        "action": "issueUnblocked",
+        "notification": {
+            "type": "issueUnblocked",
+            "userId": "user-1",
+            "actorId": "user-2",
+            "issueId": issue_id,
+            "issue": {"identifier": identifier},
+        },
+    }
+
+
+def _record_wakes(adapter):
+    wakes = []
+
+    def wake(issue_id, issue_key, text):
+        wakes.append((issue_id, issue_key, text))
+
+    adapter._dispatch_wake = wake
+    return wakes
+
+
+@pytest.mark.asyncio
+async def test_issue_unblocked_wakes_the_delegated_issue():
+    client = _FakeLinearClient()
+    client.issues["issue-1"] = {
+        "id": "issue-1",
+        "identifier": "ENG-2263",
+        "delegate": {"id": "app-1"},
+        "parent": {"id": "issue-0", "identifier": "ENG-100", "delegate": {"id": "app-1"}},
+    }
+    adapter = _make_adapter(client=client, extra={"app_user_id": "app-1", "allow_all_users": True})
+    wakes = _record_wakes(adapter)
+
+    response, status = await _post(adapter, _unblocked_app_payload(), delivery_id="evt-unblocked")
+
+    assert status == 200
+    assert response["status"] == "woken"
+    assert wakes == [("issue-1", "ENG-2263", "[sync] ENG-2263 unblocked.")]
+    assert ("get_issue", "issue-1") in client.calls
+
+
+@pytest.mark.asyncio
+async def test_issue_unblocked_wakes_the_delegated_parent_of_an_undelegated_child():
+    """A sub-issue unblocking is the parent agent's cue; the wake text names
+    the child key so the parent session knows what freed up."""
+    client = _FakeLinearClient()
+    client.issues["issue-1"] = {
+        "id": "issue-1",
+        "identifier": "ENG-2263",
+        "delegate": None,
+        "parent": {"id": "issue-parent", "identifier": "ENG-100", "delegate": {"id": "app-1"}},
+    }
+    adapter = _make_adapter(client=client, extra={"app_user_id": "app-1", "allow_all_users": True})
+    wakes = _record_wakes(adapter)
+
+    response, status = await _post(adapter, _unblocked_app_payload(), delivery_id="evt-unblocked")
+
+    assert status == 200
+    assert response["status"] == "woken"
+    assert wakes == [("issue-parent", "ENG-100", "[sync] ENG-2263 unblocked.")]
+
+
+@pytest.mark.asyncio
+async def test_issue_unblocked_ignores_an_issue_not_delegated_to_this_app():
+    client = _FakeLinearClient()
+    client.issues["issue-1"] = {
+        "id": "issue-1",
+        "identifier": "ENG-2263",
+        "delegate": {"id": "someone-else"},
+        "parent": {"id": "issue-parent", "identifier": "ENG-100", "delegate": None},
+    }
+    adapter = _make_adapter(client=client, extra={"app_user_id": "app-1", "allow_all_users": True})
+    wakes = _record_wakes(adapter)
+
+    response, status = await _post(adapter, _unblocked_app_payload(), delivery_id="evt-unblocked")
+
+    assert status == 200
+    assert response["status"] == "ignored"
+    assert wakes == []
+
+
+@pytest.mark.asyncio
+async def test_issue_unblocked_answers_200_ignored_when_the_fetch_fails():
+    """Linear disables a webhook whose endpoint returns non-2xx, so a failed
+    lookup is logged and acknowledged, never a 500."""
+    client = _FakeLinearClient()
+    client.issue_error = RuntimeError("linear is down")
+    adapter = _make_adapter(client=client, extra={"app_user_id": "app-1", "allow_all_users": True})
+    wakes = _record_wakes(adapter)
+
+    response, status = await _post(adapter, _unblocked_app_payload(), delivery_id="evt-unblocked")
+
+    assert status == 200
+    assert response["status"] == "ignored"
+    assert wakes == []
+
+
+@pytest.mark.asyncio
+async def test_non_unblocked_app_user_notifications_are_still_ignored():
+    client = _FakeLinearClient()
+    adapter = _make_adapter(client=client, extra={"app_user_id": "app-1", "allow_all_users": True})
+    wakes = _record_wakes(adapter)
+    payload = _unblocked_app_payload()
+    payload["action"] = "issueMention"
+    payload["notification"]["type"] = "issueMention"
+
+    response, status = await _post(adapter, payload, delivery_id="evt-mention")
+
+    assert status == 200
+    assert response["status"] == "ignored"
+    assert wakes == []
+    assert not any(call[0] == "get_issue" for call in client.calls)

@@ -366,6 +366,31 @@ def normalize_action(payload: Mapping[str, Any]) -> str:
     return _string(payload.get("action") or payload.get("type") or _get_path(payload, "event", "action")).lower()
 
 
+def unblocked_issue(payload: Mapping[str, Any]) -> tuple[str, str] | None:
+    """Return ``(issue_id, identifier)`` for an ``issueUnblocked`` delivery.
+
+    Linear announces an unblocked issue as an app-user notification, which is
+    neither an agent-session event nor an Issue data change: it has no
+    ``agentSession``, so it would be dropped as unsupported. Match that shape
+    exactly (``type == "AppUserNotification"``, ``action == "issueUnblocked"``,
+    a notification object naming the issue) and return the issue id plus its
+    identifier for the wake text. Anything else → ``None``.
+    """
+    if payload.get("type") != "AppUserNotification":
+        return None
+    if _string(payload.get("action")).lower() != "issueunblocked":
+        return None
+    notification = payload.get("notification")
+    if not isinstance(notification, Mapping):
+        return None
+    issue = notification.get("issue")
+    issue = issue if isinstance(issue, Mapping) else {}
+    issue_id = _string(notification.get("issueId") or issue.get("id"))
+    if not issue_id:
+        return None
+    return issue_id, _string(issue.get("identifier"))
+
+
 def extract_context(
     payload: Mapping[str, Any],
     headers: Mapping[str, str],
