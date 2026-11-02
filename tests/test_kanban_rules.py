@@ -16,13 +16,14 @@ import pytest
 from hermes_linear_agent.kanban_rules import (
     ACTED,
     CLOSED_TYPES,
-    STATE_IDS,
     Card,
+    hand_set,
     is_completed,
     is_open,
     issue_status,
     pr_gate,
     rollup,
+    team_state_name,
     transition,
 )
 
@@ -202,20 +203,50 @@ def test_pr_gate_reads_open_merged_and_none_from_attachments(links, expected):
 
 
 # ---------------------------------------------------------------------------
-# STATE_IDS (ENG-2286)
+# Per-team state names and hand-set states (ENG-2300)
 # ---------------------------------------------------------------------------
 
 
-def test_state_ids_are_the_eng_team_workflow_state_ids():
-    assert STATE_IDS == {
-        "Blocked": "8de0dfd6-614f-4d0d-9ee1-aee47a12bb58",
-        "Working": "f41a9dcb-10c9-41d9-a7cf-e83f0e49367a",
-        "Reviewing": "916a7971-5640-4989-a7ae-d8175499851f",
-        "Ready to Merge": "40c4ac3a-e45a-4817-a19b-7b94eb1bb0ed",
-        "Todo": "bb1c80eb-1a31-4616-9033-602a12b82ba0",
-        "Done": "975dfb59-166d-4df4-b70c-5382442448d8",
-        "Canceled": "7fc0e9b4-2d39-45dc-87aa-79a8d9c5ce5c",
-    }
+@pytest.mark.parametrize("status", ["Working", "Reviewing", "Ready to Merge", "Todo", "Blocked", "Done", "Canceled"])
+def test_team_state_name_is_identity_for_eng(status):
+    assert team_state_name("ENG", status) == status
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        ("Working", "In Progress"),
+        ("Reviewing", "In Review"),
+        ("Ready to Merge", "In Review"),
+        ("Todo", "Todo"),
+        ("Blocked", "Blocked"),
+        ("Done", "Done"),
+        ("Canceled", "Canceled"),
+    ],
+)
+def test_team_state_name_renames_ops_statuses(status, expected):
+    assert team_state_name("OPS", status) == expected
+
+
+@pytest.mark.parametrize("team", [None, "", "XYZ"])
+def test_team_state_name_is_identity_for_none_or_unknown_team(team):
+    assert team_state_name(team, "Working") == "Working"
+
+
+def test_hand_set_is_true_for_ops_waiting_on_client():
+    assert hand_set("OPS", "Waiting on client") is True
+
+
+def test_hand_set_is_false_for_other_states_teams_and_none():
+    assert hand_set("ENG", "Waiting on client") is False
+    assert hand_set("OPS", "In Progress") is False
+    assert hand_set("OPS", None) is False
+    assert hand_set(None, "Waiting on client") is False
+
+
+def test_rollup_reads_ops_started_names_as_working():
+    assert rollup(["In Progress"]) == "Working"
+    assert rollup(["In Review", "Done"]) == "Working"
 
 
 # ---------------------------------------------------------------------------
