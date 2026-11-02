@@ -284,8 +284,10 @@ def test_cursor_does_not_carry_over_to_a_recreated_board_db(state_dir, tmp_path)
     old_inode = os.stat(db).st_ino
     kanban_cli.save_cursor("alpha", str(db), 5)
 
-    db.unlink()
-    db.write_text("")
+    # Hold the old file open so its inode stays allocated: ext4 (CI runners) reuses a freed inode at once.
+    with open(db, "rb"):
+        db.unlink()
+        db.write_text("")
     assert os.stat(db).st_ino != old_inode, "re-creating the file must produce a new inode"
 
     assert kanban_cli.load_cursor("alpha", str(db)) is None

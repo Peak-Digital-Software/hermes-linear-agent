@@ -1030,8 +1030,10 @@ async def test_a_board_recreated_under_the_same_slug_receives_its_first_event(cl
     kanban_cli.save_cursor("eng", str(db), 5)  # the first incarnation's cursor
 
     # the board is removed and re-created under the same slug: a new inode
-    db.unlink()
-    make_board_db(db)
+    # Hold the old file open so its inode stays allocated: ext4 (CI runners) reuses a freed inode at once.
+    with open(db, "rb"):
+        db.unlink()
+        make_board_db(db)
     assert kanban_cli.load_cursor("eng", str(db)) is None, "a new inode starts from scratch"
     cli.paths["eng"] = str(db)
 
