@@ -102,6 +102,20 @@ async def show(board: str, task_id: str) -> dict:
     }
 
 
+async def done_when(board: str, task_id: str) -> str | None:
+    """The ``done_when`` metadata of the card's latest run; None on any error (ENG-2378)."""
+    try:
+        out = await _exec(["kanban", "--board", board, "show", task_id, "--json"])
+        runs = [run for run in json.loads(out).get("runs") or [] if isinstance(run, dict)]
+        if not runs:
+            return None
+        latest = max(enumerate(runs), key=lambda pair: (pair[1].get("ended_at") or 0, pair[0]))[1]
+        value = (latest.get("metadata") or {}).get("done_when")
+        return value if isinstance(value, str) else None
+    except Exception:  # noqa: BLE001 - no evidence is the safe answer
+        return None
+
+
 async def create(
     board: str,
     title: str,
