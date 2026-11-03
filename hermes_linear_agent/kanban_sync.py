@@ -492,7 +492,7 @@ class KanbanSync:
             await self._wake_parent(data, key)
 
         try:
-            archived = await self._close_cards(key)
+            archived = await self._close_cards(key, keep_running=card_action == "close")
         except asyncio.CancelledError:
             raise
         except Exception as error:  # noqa: BLE001 - log one line, never raise at the webhook
@@ -517,15 +517,19 @@ class KanbanSync:
         except Exception as error:  # noqa: BLE001 - a wake must not fail the webhook
             logger.warning("warn: wake %s: %s", parent_id, _err_line(error))
 
-    async def _close_cards(self, issue_key: str) -> int:
-        """Archive every open card of the issue on every board (3 passes max)."""
+    async def _close_cards(self, issue_key: str, *, keep_running: bool = False) -> int:
+        """Archive every open card of the issue on every board (3 passes max); keep_running spares running cards (a close lets their worker finish and move them to done)."""
         archived = 0
         for row in await kanban_cli.boards():
             board = row.get("slug")
             if not board:
                 continue
             for _pass in range(3):
-                open_ids = [card.id for card in await kanban_cli.cards(board, issue_key) if is_open(card)]
+                open_ids = [
+                    card.id
+                    for card in await kanban_cli.cards(board, issue_key)
+                    if is_open(card) and not (keep_running and card.status == "running")
+                ]
                 if not open_ids:
                     break
                 await kanban_cli.archive(board, open_ids)
