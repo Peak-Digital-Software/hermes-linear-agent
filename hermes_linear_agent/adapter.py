@@ -44,6 +44,8 @@ except Exception as e:
     logging.getLogger(__name__).warning(f"[linear_agent] Failed to register tools: {e}")
 
 from .client import DEFAULT_LINEAR_GRAPHQL_URL, LinearGraphQLClient
+from .gateway_state import gateway_draining, gateway_ready
+from .mention_cap import MentionCap
 from .oauth import (
     LINEAR_TOKEN_URL,
     LinearOAuthConfig,
@@ -52,6 +54,7 @@ from .oauth import (
     read_auth_token,
 )
 from .registry import set_active_adapter
+from .turn_journal import TurnJournal
 from .webhook import (
     SUPPORTED_ACTIONS,
     LinearWebhookContext,
@@ -59,6 +62,7 @@ from .webhook import (
     build_created_prompt,
     build_prompted_message,
     build_update_prompt,
+    comment_mention,
     describe_signature_headers,
     extract_context,
     is_authorized,
@@ -93,6 +97,9 @@ DEFAULT_WAKE_PATH = "/internal/wake"
 ISSUE_WEBHOOK_PATH = "/hermes/linear-issues"
 WAKE_MAX_SKEW_SECONDS = 300
 WAKE_TEXT_PREFIX = "[peak-agent wake] "
+RESTART_QUEUED_NOTICE = "Gateway is restarting; this message is queued and runs when it is back."
+REPLAY_POLL_INTERVAL_S = 2.0
+REPLAY_MAX_WAIT_S = 300.0
 # Agent-to-agent handoff cap. A peer session is accepted only while the issue
 # still has at most this many app-initiated sessions; beyond it a human has to
 # take over (two agents can otherwise ping an issue back and forth forever).
@@ -616,6 +623,8 @@ class LinearAgentAdapter(BasePlatformAdapter):
             extra.get("max_agent_handoffs") or _str_env("LINEAR_AGENT_MAX_AGENT_HANDOFFS"),
             DEFAULT_MAX_AGENT_HANDOFFS,
         )
+        self._turn_journal = TurnJournal(_default_auth_path().parent / "turn_journal.json")
+        self._mention_cap = MentionCap(_default_auth_path().parent / "peer_mentions.json", self._max_agent_handoffs)
         self._allow_all_users = _bool_opt(extra, "allow_all_users", "LINEAR_AGENT_ALLOW_ALL_USERS", False)
         self._ack_on_created = _boolish(extra.get("ack_on_created"), True)
         self._ack_body = str(extra.get("ack_body") or DEFAULT_ACK_BODY)
@@ -761,7 +770,53 @@ class LinearAgentAdapter(BasePlatformAdapter):
             self._webhook_path,
         )
         set_active_adapter(self)
+        replay = asyncio.create_task(self._replay_after_restart())
+        self._background_tasks.add(replay)
+        replay.add_done_callback(self._background_tasks.discard)
         return True
+
+    async def _replay_after_restart(self) -> None:
+        """Re-run turns a gateway restart interrupted or held back."""
+        waited = 0.0
+        while not gateway_ready():
+            if waited >= REPLAY_MAX_WAIT_S:
+                logger.warning("[linear_agent] Gateway not ready after %.0fs; replaying journal anyway", waited)
+                break
+            await asyncio.sleep(REPLAY_POLL_INTERVAL_S)
+            waited += REPLAY_POLL_INTERVAL_S
+        queued, interrupted = self._turn_journal.take_pending()
+        for entry in interrupted:
+            self._dispatch_wake(entry.issue_id, entry.issue_key, "Resume after gateway restart")
+        for entry in queued:
+            self._dispatch_wake(
+                entry.issue_id,
+                entry.issue_key,
+                "Message received while the gateway was restarting:\n\n" + entry.text,
+            )
+        logger.info(
+            "[linear_agent] Replayed %d queued and %d interrupted turns after restart",
+            len(queued),
+            len(interrupted),
+        )
+
+    def _hold_if_draining(self, issue_id: str, issue_key: str, text: str) -> bool:
+        """Queue the turn while the gateway drains (True); else mark it in flight (False)."""
+        if not gateway_draining():
+            self._turn_journal.start(issue_id, issue_key, text)
+            return False
+        self._turn_journal.queue(issue_id, issue_key, text)
+        notice = asyncio.get_running_loop().create_task(self._post_queued_notice(issue_id))
+        self._background_tasks.add(notice)
+        notice.add_done_callback(self._background_tasks.discard)
+        return True
+
+    async def _post_queued_notice(self, issue_id: str) -> None:
+        try:
+            session_id, _ = await self._resolve_reply_session(issue_id)
+            if session_id:
+                await self._client.create_thought(session_id, RESTART_QUEUED_NOTICE)
+        except Exception as exc:  # noqa: BLE001 - best effort
+            logger.warning("[linear_agent] Failed to post queued notice for %s: %s", issue_id, exc)
 
     async def _discover_app_user_id(self) -> None:
         """Fill a missing app_user_id from Linear's viewer at connect.
@@ -1102,6 +1157,24 @@ class LinearAgentAdapter(BasePlatformAdapter):
         reply_to: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> SendResult:
+        if "runtime_draining" in content:
+            # Core's turn-error notice for a refused admission: keep the turn
+            # for replay and say nothing to Linear but the queued thought.
+            self._turn_journal.requeue(chat_id)
+            await self._post_queued_notice(chat_id)
+            return SendResult(success=True)
+        result = await self._send_response(chat_id, content, reply_to, metadata)
+        if result.success and not (metadata or {}).get("_interim_send"):
+            self._turn_journal.finish(chat_id)
+        return result
+
+    async def _send_response(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> SendResult:
         """Send the final Hermes response to Linear.
 
         ``chat_id`` is the ISSUE id (the Hermes session is keyed per issue, see
@@ -1208,6 +1281,7 @@ class LinearAgentAdapter(BasePlatformAdapter):
         except Exception as exc:  # noqa: BLE001
             logger.warning("[linear_agent] Failed to create error activity: %s", exc)
             return SendResult(success=False, error=str(exc))
+        self._turn_journal.finish(chat_id)
         return SendResult(
             success=True,
             message_id=str(activity.get("id") or ""),
@@ -1496,6 +1570,8 @@ class LinearAgentAdapter(BasePlatformAdapter):
 
     def _dispatch_wake(self, issue_id: str, issue_key: str, text: str) -> None:
         """Queue the wake turn; the HTTP call answers 202 immediately."""
+        if self._hold_if_draining(issue_id, issue_key, text):
+            return
         context = self._wake_context(issue_id, issue_key)
         source = self._build_source(context)
         event = MessageEvent(
@@ -1519,6 +1595,30 @@ class LinearAgentAdapter(BasePlatformAdapter):
             await self.handle_message(event)
         except Exception:  # noqa: BLE001 - background task must never raise into the loop
             logger.exception("[linear_agent] Wake turn failed for %s", event.source.chat_id)
+
+    async def _route_peer_mention(self, mention: Any) -> tuple[dict[str, Any], int]:
+        """Turn a peer agent's comment mention into a wake turn (humans get native sessions)."""
+        if self._dedup.is_duplicate(mention.notification_id):
+            return {"status": "duplicate"}, 200
+        actor = mention.actor_id
+        if actor == self._app_user_id or actor not in self._peer_app_user_ids:
+            return {"status": "ignored", "reason": "not a peer mention"}, 200
+        session_id, _ = await self._resolve_reply_session(mention.issue_id)
+        if not session_id:
+            return {"status": "ignored", "reason": "no session"}, 200
+        allowed, count = self._mention_cap.allow(mention.issue_id)
+        if not allowed:
+            await self._post_session_activity(
+                session_id,
+                f"Handoff limit reached: {count} agent-to-agent mentions on this issue. Tom needs to step in.",
+            )
+            return {"status": "refused", "reason": "handoff limit reached"}, 200
+        self._dispatch_wake(
+            mention.issue_id,
+            mention.issue_key,
+            f"{mention.actor_name} mentioned you in a comment on {mention.issue_key}:\n\n{mention.body}",
+        )
+        return {"status": "accepted"}, 200
 
     async def _route_issue_unblocked(self, issue_id: str, identifier: str) -> tuple[dict[str, Any], int]:
         """Wake the issue (or its parent) when it unblocks under our delegation.
@@ -1628,6 +1728,9 @@ class LinearAgentAdapter(BasePlatformAdapter):
         unblocked = unblocked_issue(payload)
         if unblocked is not None:
             return await self._route_issue_unblocked(*unblocked)
+        mention = comment_mention(payload)
+        if mention is not None:
+            return await self._route_peer_mention(mention)
 
         # Filter unsupported deliveries BEFORE strict context extraction: with
         # extra webhook categories enabled Linear sends data-change events
@@ -2394,6 +2497,8 @@ class LinearAgentAdapter(BasePlatformAdapter):
         profile: str | None = None,
     ) -> None:
         if context.action == "prompted" and await self._try_resolve_approval_reply(context, message, profile=profile):
+            return
+        if self._hold_if_draining(context.issue_id, context.issue_identifier, message):
             return
         source = self._build_source(context, profile=profile)
         event = MessageEvent(

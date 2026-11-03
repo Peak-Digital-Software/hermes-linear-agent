@@ -391,6 +391,52 @@ def unblocked_issue(payload: Mapping[str, Any]) -> tuple[str, str] | None:
     return issue_id, _string(issue.get("identifier"))
 
 
+@dataclass(frozen=True)
+class CommentMention:
+    notification_id: str
+    issue_id: str
+    issue_key: str
+    actor_id: str
+    actor_name: str
+    comment_id: str
+    body: str
+
+
+def comment_mention(payload: Mapping[str, Any]) -> CommentMention | None:
+    """Return a ``CommentMention`` for an ``issueCommentMention`` delivery.
+
+    Same shape as ``unblocked_issue``: an ``AppUserNotification`` with a
+    notification object. ``None`` when the issue, actor or body is missing.
+    """
+    if payload.get("type") != "AppUserNotification":
+        return None
+    if _string(payload.get("action")).lower() != "issuecommentmention":
+        return None
+    notification = payload.get("notification")
+    if not isinstance(notification, Mapping):
+        return None
+
+    def _map(key: str) -> Mapping[str, Any]:
+        value = notification.get(key)
+        return value if isinstance(value, Mapping) else {}
+
+    issue, actor, comment = _map("issue"), _map("actor"), _map("comment")
+    issue_id = _string(notification.get("issueId") or issue.get("id"))
+    actor_id = _string(notification.get("actorId") or actor.get("id"))
+    body = _string(comment.get("body"))
+    if not issue_id or not actor_id or not body:
+        return None
+    return CommentMention(
+        notification_id=_string(notification.get("id")),
+        issue_id=issue_id,
+        issue_key=_string(issue.get("identifier")),
+        actor_id=actor_id,
+        actor_name=_string(actor.get("name")),
+        comment_id=_string(notification.get("commentId") or comment.get("id")),
+        body=body,
+    )
+
+
 def extract_context(
     payload: Mapping[str, Any],
     headers: Mapping[str, str],
