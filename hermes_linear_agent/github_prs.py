@@ -25,6 +25,7 @@ class OpenPr:
     head_sha: str
     title: str
     base: str
+    branch: str = ""
 
 
 async def _run(gh: str, args: list[str]) -> str:
@@ -68,21 +69,39 @@ def _json_pages(text: str) -> list[Any]:
     return items
 
 
-async def internal_repos(gh: str, org: str) -> list[str]:
-    """Full names whose ``production`` property is exactly ``"false"``."""
+async def _production_values(gh: str, org: str) -> dict[str, str | None]:
+    """Full name -> raw ``production`` property value (None when unset); one ``gh api`` call."""
     out = await _run(gh, ["api", f"orgs/{org}/properties/values", "--paginate"])
-    names: list[str] = []
+    values: dict[str, str | None] = {}
     for row in _json_pages(out):
         if not isinstance(row, dict):
             continue
         full_name = row.get("repository_full_name")
         if not full_name:
             continue
+        value = None
         for prop in row.get("properties") or []:
-            if isinstance(prop, dict) and prop.get("property_name") == "production" and prop.get("value") == "false":
-                names.append(full_name)
+            if isinstance(prop, dict) and prop.get("property_name") == "production":
+                value = prop.get("value")
                 break
-    return names
+        values[full_name] = value
+    return values
+
+
+async def repos_by_production(gh: str, org: str) -> dict[str, bool]:
+    """Full name -> whether ``production`` is ``"true"``; a repo with no value counts as False."""
+    return {name: value == "true" for name, value in (await _production_values(gh, org)).items()}
+
+
+async def internal_repos(gh: str, org: str) -> list[str]:
+    """Full names whose ``production`` property is exactly ``"false"``."""
+    return [name for name, value in (await _production_values(gh, org)).items() if value == "false"]
+
+
+async def changed_files(gh: str, full_name: str, number: int) -> list[str]:
+    """Paths touched by one PR."""
+    out = await _run(gh, ["api", f"repos/{full_name}/pulls/{number}/files", "--paginate", "--jq", ".[].filename"])
+    return [line for line in out.splitlines() if line.strip()]
 
 
 async def open_prs(gh: str, full_name: str) -> list[OpenPr]:
@@ -97,7 +116,7 @@ async def open_prs(gh: str, full_name: str) -> list[OpenPr]:
             "--state",
             "open",
             "--json",
-            "number,url,headRefOid,title,isDraft,baseRefName",
+            "number,url,headRefOid,title,isDraft,baseRefName,headRefName",
         ],
     )
     repo = full_name.rsplit("/", 1)[-1]
@@ -114,6 +133,7 @@ async def open_prs(gh: str, full_name: str) -> list[OpenPr]:
                 head_sha=row["headRefOid"],
                 title=row["title"],
                 base=row["baseRefName"],
+                branch=row.get("headRefName") or "",
             )
         )
     return prs

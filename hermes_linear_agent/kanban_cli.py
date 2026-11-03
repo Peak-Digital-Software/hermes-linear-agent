@@ -126,6 +126,7 @@ async def create(
     idempotency_key: str,
     workspace: str,
     completion_contract: str = "local-only",
+    skills: list[str] | None = None,
 ) -> str:
     """Create (or, same key, return) a card; returns its id.
 
@@ -155,6 +156,7 @@ async def create(
                 workspace,
                 "--completion-contract",
                 completion_contract,
+                *[arg for skill in skills or [] for arg in ("--skill", skill)],
                 "--json",
             ]
         )

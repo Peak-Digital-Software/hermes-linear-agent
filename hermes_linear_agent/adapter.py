@@ -520,6 +520,7 @@ def _apply_yaml_config(yaml_cfg: dict, platform_cfg: dict) -> dict[str, Any] | N
         "max_body_bytes",
         "kanban_sync",
         "kanban_pr_gh",
+        "kanban_pr_proof",
         "issue_webhook_secret",
     ):
         if key in platform_cfg:
@@ -685,6 +686,7 @@ class LinearAgentAdapter(BasePlatformAdapter):
         self._kanban_pr_gh = (
             str(extra.get("kanban_pr_gh") or _str_env("LINEAR_AGENT_KANBAN_PR_GH") or "").strip() or None
         )
+        self._kanban_pr_proof = _bool_opt(extra, "kanban_pr_proof", "LINEAR_AGENT_KANBAN_PR_PROOF", False)
         self._issue_webhook_secret = str(
             extra.get("issue_webhook_secret") or _str_env("LINEAR_ISSUE_WEBHOOK_SECRET") or ""
         ).strip()
@@ -898,6 +900,8 @@ class LinearAgentAdapter(BasePlatformAdapter):
         # The sync wakes sessions through this adapter's dispatcher: a wake is
         # a real turn on the issue's Hermes session, not a webhook delivery.
         pr_opts = {"pr_gh": self._kanban_pr_gh} if self._kanban_pr_gh else {}
+        if self._kanban_pr_proof:
+            pr_opts["pr_proof"] = True
         if self._app_user_id:
             pr_opts["app_user_id"] = self._app_user_id
         sync = sync_cls(self._client, wake=self._dispatch_wake, **pr_opts)

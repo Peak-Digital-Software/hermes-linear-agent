@@ -80,7 +80,7 @@ async def test_open_prs_parses_fixture_and_skips_drafts(monkeypatch):
         "--state",
         "open",
         "--json",
-        "number,url,headRefOid,title,isDraft,baseRefName",
+        "number,url,headRefOid,title,isDraft,baseRefName,headRefName",
     )
     assert [p.number for p in prs] == [22, 21]
     assert prs[0] == github_prs.OpenPr(
