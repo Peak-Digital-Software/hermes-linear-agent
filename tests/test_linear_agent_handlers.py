@@ -1664,3 +1664,27 @@ async def test_update_issue_registry_dispatch_kwargs_do_not_hijack_id(ref, paylo
     assert not any("hermes-task-xyz" in map(str, c) for c in client.calls)
     # Dispatcher kwargs must not leak into the update payload either.
     assert not any(c[0] == "update_issue" and "session_id" in c[2] for c in client.calls)
+
+
+class _CommentRefClient(_KeyedRefClient):
+    async def create_comment(self, issue_id, body, *, parent_id=None, extra_input=None, mutation_policy=None):
+        self.calls.append(("create_comment", issue_id, body, parent_id, extra_input))
+        return {"id": "c-new"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("arg_name", ["issue_id", "issueId"])
+@pytest.mark.parametrize("ref", ["OPS-47", _U23])
+async def test_create_comment_registry_dispatch_kwargs_do_not_hijack_issue_id(ref, arg_name):
+    from hermes_linear_agent import tools as t
+
+    adapter = _adapter_with_ref_client()
+    adapter._client = client = _CommentRefClient()
+
+    result = await _registry_call(t.linear_agent_create_comment, {arg_name: ref, "body": "hi"})
+
+    assert result.startswith("✅"), result
+    recorded = [c for c in client.calls if c[0] == "create_comment"]
+    assert len(recorded) == 1
+    assert recorded[0][1] == ref
+    assert not any("hermes-task-xyz" in map(str, c) for c in client.calls)
