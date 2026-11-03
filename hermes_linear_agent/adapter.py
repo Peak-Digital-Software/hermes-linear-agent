@@ -43,6 +43,7 @@ try:
 except Exception as e:
     logging.getLogger(__name__).warning(f"[linear_agent] Failed to register tools: {e}")
 
+from . import go_gate
 from .client import DEFAULT_LINEAR_GRAPHQL_URL, LinearGraphQLClient
 from .gateway_state import gateway_draining, gateway_ready
 from .mention_cap import MentionCap
@@ -1227,6 +1228,33 @@ class LinearAgentAdapter(BasePlatformAdapter):
                 logger.warning("[linear_agent] Failed to create failed-turn error activity: %s", exc)
                 return SendResult(success=False, error=str(exc))
             return SendResult(success=True, message_id=str(activity.get("id") or "") or None)
+        gate_pattern = go_gate.match(content)
+        if gate_pattern:
+            # Only a hit costs a query. Fail open: an unreadable issue posts
+            # the normal response but is still logged.
+            try:
+                scope = go_gate.scope_for(await self._client.get_issue(issue_id or chat_id))
+            except Exception as exc:  # noqa: BLE001 - fail open
+                logger.warning("[linear_agent] go-gate scope lookup failed for %s: %s", chat_id, exc)
+                scope = "unknown"
+            gated = scope == "gated"
+            go_gate.log_hit(
+                issue=issue_id or chat_id,
+                session=agent_session_id,
+                profile=self._own_profile_name() or None,
+                pattern=gate_pattern,
+                posted_as="thought" if gated else "response",
+                scope=scope,
+            )
+            if gated:
+                # A response would complete the session; the human's answer
+                # must land in a live one. Full text, no mirror.
+                try:
+                    activity = await self._client.create_thought(agent_session_id, content)
+                except Exception as exc:  # noqa: BLE001 - adapter boundary returns SendResult
+                    logger.warning("[linear_agent] Failed to create go-gate thought activity: %s", exc)
+                    return SendResult(success=False, error=str(exc))
+                return SendResult(success=True, message_id=str(activity.get("id") or "") or None)
         chunks = _split_message(content, self.MAX_MESSAGE_LENGTH)
         try:
             # Nothing upstream chunks the non-streaming path, so oversized
