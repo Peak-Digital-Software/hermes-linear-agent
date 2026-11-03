@@ -1,0 +1,34 @@
+# Linear Release: every push to the default branch becomes a release in this repo's Linear pipeline (ENG-2351).
+# Key: repo secret LINEAR_ACCESS_KEY = the pipeline access key (Linear Settings -> Releases).
+name: Linear Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linear-release
+  cancel-in-progress: false
+
+jobs:
+  linear-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the action scans commit history for issue ids
+
+      - id: meta
+        run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - uses: linear/linear-release-action@dd4fc407f860b9460d2cf0b3fb1edd8985cf443f # v0.18.2
+        with:
+          access_key: ${{ secrets.LINEAR_ACCESS_KEY }}
+          name: ${{ github.event.repository.name }} ${{ steps.meta.outputs.short }}
+          version: ${{ github.sha }}
+          # Scan only this push's commits: some pipelines serve two repos, so "since the last release" can name another repo's sha.
+          base_ref: ${{ github.event.before != '0000000000000000000000000000000000000000' && github.event.before || '' }}
