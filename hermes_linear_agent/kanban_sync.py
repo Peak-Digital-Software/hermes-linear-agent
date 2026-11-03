@@ -35,6 +35,7 @@ from typing import Any
 import watchfiles
 
 from . import kanban_cli, pr_reconcile
+from . import pr_proof as pr_proof_module
 from .kanban_rules import (
     ACTED,
     CLOSED_TYPES,
@@ -191,6 +192,7 @@ class KanbanSync:
         reconcile_seconds: float = RECONCILE_SECONDS,
         pr_gh: str | None = None,
         pr_seconds: float = 900.0,
+        pr_proof: bool = False,
         app_user_id: str = "",
         waiter_seconds: float = 900.0,
     ) -> None:
@@ -199,6 +201,7 @@ class KanbanSync:
         self.reconcile_seconds = reconcile_seconds
         self.pr_gh = pr_gh
         self.pr_seconds = pr_seconds
+        self.pr_proof = pr_proof
         self._wake = wake
         self.waiter_seconds = waiter_seconds
         self._waiters: Waiters | None = (
@@ -514,6 +517,13 @@ class KanbanSync:
                 raise
             except Exception as error:  # noqa: BLE001 - a failed pass must not kill the timer
                 logger.error("pr reconcile failed: %s", _message(error))
+            if self.pr_proof:
+                try:
+                    await pr_proof_module.reconcile_proofs(gh=str(self.pr_gh))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:  # noqa: BLE001 - a failed pass must not kill the timer
+                    logger.error("pr proof failed: %s", _message(error))
             await asyncio.sleep(self.pr_seconds)
 
     async def reconcile(self) -> int:

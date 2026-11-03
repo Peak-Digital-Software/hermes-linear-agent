@@ -1080,6 +1080,31 @@ async def test_the_pr_loop_survives_a_raising_pass(monkeypatch):
         await asyncio.gather(task, return_exceptions=True)
 
 
+@pytest.mark.parametrize("flag", [False, True])
+async def test_the_pr_loop_calls_reconcile_proofs_only_when_the_flag_is_on(monkeypatch, flag):
+    proofs = []
+    reviews = []
+
+    async def review(*, gh):
+        reviews.append(gh)
+        return []
+
+    async def proof(*, gh):
+        proofs.append(gh)
+        return []
+
+    monkeypatch.setattr("hermes_linear_agent.pr_reconcile.reconcile_prs", review)
+    monkeypatch.setattr("hermes_linear_agent.pr_proof.reconcile_proofs", proof)
+    sync = KanbanSync(FakeClient(), pr_gh="/bin/gh", pr_seconds=0, pr_proof=flag)
+    task = asyncio.create_task(sync._pr_loop())
+    try:
+        await until(lambda: len(reviews) >= 2)
+        assert (proofs[:2] == ["/bin/gh", "/bin/gh"]) if flag else proofs == []
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
 async def test_cancelling_the_discovery_task_cancels_its_followers(boards, idle_watch, tmp_path):
     sync = KanbanSync(FakeClient(), boards_root=tmp_path / "boards", reconcile_seconds=60)
     boards.cursors[BOARD] = 0
