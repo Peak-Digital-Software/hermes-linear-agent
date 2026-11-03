@@ -961,7 +961,7 @@ async def test_app_created_issue_without_an_allowlisted_assignee_still_refuses(a
     _, status = await _post(adapter, _rule_delegated_payload(), delivery_id="evt-rule")
     await _settle()
 
-    assert status == 403
+    assert status == (200 if assignee is None else 403)  # ENG-2408: no sender at all is a visible 200 rejection
     assert events == []
 
 
@@ -995,7 +995,7 @@ async def test_rule_delegated_session_refuses_when_the_issue_creator_lookup_fail
     _, status = await _post(adapter, _rule_delegated_payload(), delivery_id="evt-rule")
     await _settle()
 
-    assert status == 403
+    assert status == 200  # ENG-2408: unresolved sender is rejected visibly
     assert events == []
 
 
@@ -1081,7 +1081,7 @@ async def test_sentry_filed_issue_without_a_usable_assignee_is_refused(assignee)
     _, status = await _post_sentry(adapter)
     await _settle()
 
-    assert status == 403
+    assert status == 200  # ENG-2408: unresolved sender is rejected visibly
     assert events == []
 
 
@@ -1094,7 +1094,7 @@ async def test_failed_creator_lookup_does_not_fall_back_to_the_assignee():
 
     _, status = await _post_sentry(adapter)
 
-    assert status == 403
+    assert status == 200  # ENG-2408: unresolved sender is rejected visibly
     assert ("get_issue", _SENTRY_ISSUE_ID) not in client.calls
 
 
