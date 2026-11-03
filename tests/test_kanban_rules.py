@@ -224,8 +224,9 @@ def test_team_state_name_is_identity_for_eng(status):
         ("Canceled", "Canceled"),
     ],
 )
-def test_team_state_name_renames_ops_statuses(status, expected):
-    assert team_state_name("OPS", status) == expected
+@pytest.mark.parametrize("team", ["OPS", "ENB"])
+def test_team_state_name_renames_ops_statuses(team, status, expected):
+    assert team_state_name(team, status) == expected
 
 
 @pytest.mark.parametrize("team", [None, "", "XYZ"])
@@ -233,14 +234,17 @@ def test_team_state_name_is_identity_for_none_or_unknown_team(team):
     assert team_state_name(team, "Working") == "Working"
 
 
-def test_hand_set_is_true_for_ops_waiting_on_client():
-    assert hand_set("OPS", "Waiting on client") is True
+@pytest.mark.parametrize("team", ["OPS", "ENB"])
+def test_hand_set_is_true_for_ops_waiting_on_client(team):
+    assert hand_set(team, "Waiting on client") is True
 
 
 def test_hand_set_is_false_for_other_states_teams_and_none():
     assert hand_set("ENG", "Waiting on client") is False
     assert hand_set("OPS", "In Progress") is False
     assert hand_set("OPS", None) is False
+    assert hand_set("ENB", "In Progress") is False
+    assert hand_set("ENB", None) is False
     assert hand_set(None, "Waiting on client") is False
 
 

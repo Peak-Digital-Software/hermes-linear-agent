@@ -61,7 +61,7 @@ def state(name: str, team: str = "ENG") -> dict[str, str]:
 
 
 def team_of(identifier: str) -> dict[str, str]:
-    key = "OPS" if identifier.startswith("OPS-") else "ENG"
+    key = next((k for k in ("OPS", "ENB") if identifier.startswith(f"{k}-")), "ENG")
     return {"id": f"team-{key.lower()}", "key": key}
 
 
@@ -151,7 +151,7 @@ class FakeClient:
             return {"issue": {"attachments": {"nodes": self.attachments.get(str(variables["id"]), [])}}}
 
         if query.startswith("query TeamStates("):
-            states = OPS_STATES if variables.get("teamId") == "team-ops" else self.states
+            states = OPS_STATES if variables.get("teamId") in {"team-ops", "team-enb"} else self.states
             nodes = [{"id": state_id, "name": name, "type": state_type} for name, state_id, state_type in states]
             return {"team": {"states": {"nodes": nodes}}}
 
@@ -195,7 +195,8 @@ class FakeClient:
                     await asyncio.sleep(self.delay)
                 if self.fail_active is not None:
                     raise self.fail_active
-                pages = self.ops_pages if variables.get("team") == "OPS" else self.active_pages
+                team = variables.get("team")
+                pages = {"ENG": self.active_pages, "OPS": self.ops_pages}.get(team, {})
                 page = pages.get(variables.get("after"), EMPTY_PAGE)
                 return {"issues": page}
             finally:
@@ -1513,6 +1514,7 @@ async def test_active_issues_pages_every_team_key(boards):
         ("ENG", None),
         ("OPS", None),
         ("OPS", "c1"),
+        ("ENB", None),
     ]
 
 
