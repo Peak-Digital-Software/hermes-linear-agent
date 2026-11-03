@@ -1,0 +1,87 @@
+{
+  "type": "AgentSessionEvent",
+  "action": "created",
+  "createdAt": "2026-11-03T11:18:13.472Z",
+  "organizationId": "73dc716b-216c-4127-b078-0235cb85978f",
+  "oauthClientId": "3ba99dc4d30de0ab13bb16210635e071",
+  "appUserId": "9c7f2bb0-74a5-47d3-bbeb-ad5caa0fb037",
+  "agentSession": {
+    "id": "cc1db682-075a-4994-931e-04ed86ff4eac",
+    "createdAt": "2026-11-03T11:18:12.833Z",
+    "updatedAt": "2026-11-03T11:18:12.833Z",
+    "archivedAt": null,
+    "creatorId": null,
+    "appUserId": "9c7f2bb0-74a5-47d3-bbeb-ad5caa0fb037",
+    "commentId": "8e3db9f0-af43-4717-a452-4308adb1f155",
+    "sourceCommentId": null,
+    "issueId": "d69a3f47-862f-4f53-bb35-0e3a61551612",
+    "pullRequestId": null,
+    "slugId": "77f40db1acc19",
+    "status": "pending",
+    "startedAt": null,
+    "endedAt": null,
+    "dismissedAt": null,
+    "dismissedById": null,
+    "externalLink": null,
+    "summary": null,
+    "sourceMetadata": null,
+    "modelSelection": null,
+    "plan": null,
+    "workspaceDiff": null,
+    "context": [],
+    "url": "https://linear.app/peak-software-development/agent-session/cc1db682-075a-4994-931e-04ed86ff4eac",
+    "externalUrls": [],
+    "organizationId": "73dc716b-216c-4127-b078-0235cb85978f",
+    "comment": {
+      "id": "8e3db9f0-af43-4717-a452-4308adb1f155",
+      "body": "This thread is for an agent session with baxter.",
+      "issueId": "d69a3f47-862f-4f53-bb35-0e3a61551612"
+    },
+    "issue": {
+      "id": "d69a3f47-862f-4f53-bb35-0e3a61551612",
+      "title": "Match Shopify shipping rates to the portal",
+      "teamId": "714f3aa0-88a8-4880-80e1-064ef02e67ce",
+      "team": {
+        "id": "714f3aa0-88a8-4880-80e1-064ef02e67ce",
+        "key": "OPS",
+        "name": "Operations"
+      },
+      "identifier": "OPS-38",
+      "url": "https://linear.app/peak-software-development/issue/OPS-38/match-shopify-shipping-rates-to-the-portal",
+      "description": "(redacted)"
+    }
+  },
+  "agentActivity": {
+    "id": "03e4b341-f060-4498-9471-99fd5a09820e",
+    "createdAt": "2026-11-03T11:18:12.833Z",
+    "updatedAt": "2026-11-03T11:18:12.833Z",
+    "archivedAt": null,
+    "agentSessionId": "cc1db682-075a-4994-931e-04ed86ff4eac",
+    "sourceCommentId": "8e3db9f0-af43-4717-a452-4308adb1f155",
+    "userId": "9c7f2bb0-74a5-47d3-bbeb-ad5caa0fb037",
+    "sourceMetadata": null,
+    "executionSkippedReason": null,
+    "signal": null,
+    "ephemeral": false,
+    "pushSummary": null,
+    "queued": false,
+    "sentAt": null,
+    "signalMetadata": null,
+    "content": {
+      "type": "prompt",
+      "body": "Work on OPS-38"
+    },
+    "user": {
+      "id": "9c7f2bb0-74a5-47d3-bbeb-ad5caa0fb037",
+      "name": "Baxter",
+      "email": "baxter@oauthapp.invalid",
+      "avatarUrl": null,
+      "url": "https://linear.app/peak-software-development/profiles/baxter"
+    }
+  },
+  "previousComments": null,
+  "guidance": null,
+  "promptContext": "<issue identifier=\"OPS-38\"><title>Match Shopify shipping rates to the portal</title></issue>",
+  "webhookTimestamp": 1793704693502,
+  "webhookId": "a8f5e591-8c2c-4246-ab91-5bad6d38cc25"
+}

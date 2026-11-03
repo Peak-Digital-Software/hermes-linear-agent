@@ -85,6 +85,11 @@ logger = logging.getLogger(__name__)
 # to widen it deliberately.
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8651
+NO_SENDER_ERROR = (
+    "Refused: no trusted sender for this session. The issue has no human creator, "
+    "assignee or delegating user (an agent delegating to itself does not count). "
+    "Ask Tom or a peer agent to delegate it again."
+)
 DEFAULT_WEBHOOK_PATH = "/hermes/linear-agent"
 DEFAULT_ACK_BODY = "I’m starting work on this."
 # Loopback wake endpoint. Deliberately OUTSIDE the webhook path and without a
@@ -1844,6 +1849,33 @@ class LinearAgentAdapter(BasePlatformAdapter):
         # author BEFORE authorization (fail closed if it cannot be resolved).
         context = await self._resolve_sender(context)
 
+        # An unresolved sender is refused on purpose and visibly: a session
+        # with no trusted sender gets an error activity instead of a silent 403.
+        # (A self-echo has a sender - this app - and stays a silent 403.)
+        if context.action in ("created", "prompted") and not str(context.actor_user_id or "").strip():
+            if self._dedup.is_duplicate(context.delivery_id):
+                return {
+                    "status": "duplicate",
+                    "delivery_id": context.delivery_id,
+                }, 200
+            logger.warning(
+                "[linear_agent] Rejected webhook: no sender could be resolved for session %s",
+                context.agent_session_id,
+            )
+            try:
+                await self._client.create_error(context.agent_session_id, NO_SENDER_ERROR)
+            except Exception as exc:  # noqa: BLE001 - never fail the webhook
+                logger.warning(
+                    "[linear_agent] Could not post rejection for session %s: %s",
+                    context.agent_session_id,
+                    exc,
+                )
+            return {
+                "status": "rejected",
+                "reason": "no sender could be resolved",
+                "delivery_id": context.delivery_id,
+            }, 200
+
         if not self._webhook_sender_authorized(context):
             logger.warning(
                 "[linear_agent] Rejected webhook for unauthorized user/team user=%s team=%s",
@@ -2021,7 +2053,9 @@ class LinearAgentAdapter(BasePlatformAdapter):
         ``agentSession.creatorId``, then the session comment's author
         (payload field, else a Linear lookup), then the issue's creator
         (payload field, else a Linear lookup), then, when the issue has no
-        human creator or the creator is this app, the issue's assignee.
+        human creator or the creator is this app, the issue's assignee, then,
+        when the assignee is empty or this app, the user who delegated the
+        issue to this app (issue history; a self-delegation does not count).
 
         Linear leaves the session creator null both for machine handoffs
         (another agent app is the real sender, readable from the session's
@@ -2136,9 +2170,27 @@ class LinearAgentAdapter(BasePlatformAdapter):
             return "", ""
         assignee = issue.get("assignee") if isinstance(issue, dict) else None
         assignee_id = str(((assignee or {}).get("id")) or "").strip()
-        if not assignee_id or (self._app_user_id and assignee_id == self._app_user_id):
+        if assignee_id and not (self._app_user_id and assignee_id == self._app_user_id):
+            return assignee_id, "issue_assignee"
+        # No usable assignee: the user who delegated the issue to this app is
+        # the last evidence of who the work is for. A self-delegation is not.
+        if not self._app_user_id:
             return "", ""
-        return assignee_id, "issue_assignee"
+        try:
+            delegator_id = str(
+                await self._client.get_issue_delegator_user_id(issue_id, self._app_user_id) or ""
+            ).strip()
+        except Exception as exc:  # noqa: BLE001 - unresolved sender must stay unauthorized
+            logger.warning(
+                "[linear_agent] Could not resolve the delegator of issue %s for session %s: %s",
+                issue_id,
+                context.agent_session_id,
+                exc,
+            )
+            return "", ""
+        if not delegator_id or delegator_id == self._app_user_id:
+            return "", ""
+        return delegator_id, "issue_delegator"
 
     def _is_peer_sender(self, context: LinearWebhookContext) -> bool:
         """True when the sender is a listed peer app (and not ourselves)."""
