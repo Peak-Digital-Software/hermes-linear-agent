@@ -1514,3 +1514,124 @@ async def test_active_issues_pages_every_team_key(boards):
         ("OPS", None),
         ("OPS", "c1"),
     ]
+
+
+# -- ENG-2343: wake the delegated ancestor of an undelegated waiter ----------
+
+
+def _waiting_issue(identifier: str, blocker_state: str, parent: dict[str, Any] | None) -> dict[str, Any]:
+    return {
+        "id": f"issue-{identifier}",
+        "identifier": identifier,
+        "state": {"type": "unstarted"},
+        "delegate": None,
+        "inverseRelations": {
+            "nodes": [
+                {
+                    "type": "blocks",
+                    "issue": {"id": "issue-ENG-9", "identifier": "ENG-9", "state": {"type": blocker_state}},
+                }
+            ]
+        },
+        "parent": parent,
+    }
+
+
+class WaiterClient(FakeClient):
+    """FakeClient that also answers the waiters' BlockedByMe query."""
+
+    def __init__(self, waiting: dict[str, Any], **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.waiting = waiting
+
+    async def execute(self, query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
+        if query.startswith("query BlockedByMe("):
+            self.calls.append((query, variables or {}))
+            return {
+                "issue": {
+                    "id": "issue-ENG-9",
+                    "relations": {"nodes": [{"type": "blocks", "relatedIssue": self.waiting}]},
+                }
+            }
+        return await super().execute(query, variables)
+
+
+GRANDPARENT_CHAIN = {
+    "id": "issue-ENG-2",
+    "identifier": "ENG-2",
+    "delegate": None,
+    "parent": {"id": "issue-ENG-1", "identifier": "ENG-1", "delegate": {"id": "app-1"}, "parent": None},
+}
+
+
+async def test_blocker_done_wakes_the_delegated_ancestor_of_an_undelegated_waiter(boards):
+    wakes: list[tuple[str, str, str]] = []
+    waiting = _waiting_issue("ENG-5", "completed", GRANDPARENT_CHAIN)
+    sync = KanbanSync(
+        WaiterClient(waiting),
+        wake=lambda i, k, t: wakes.append((i, k, t)),
+        app_user_id="app-1",
+    )
+    payload = issue_payload("ENG-9", was_state="s-working", now_state="s-done")
+    payload["data"]["id"] = "issue-ENG-9"
+
+    await sync.handle_issue_webhook(payload)
+
+    assert wakes == [("issue-ENG-1", "ENG-1", "[sync] ENG-5 unblocked.")]
+
+
+async def test_waiter_failure_never_fails_the_webhook(boards):
+    class Boom(WaiterClient):
+        async def execute(self, query, variables=None):
+            if query.startswith("query BlockedByMe("):
+                raise RuntimeError("linear down")
+            return await super().execute(query, variables)
+
+    sync = KanbanSync(Boom({}), wake=lambda *a: None, app_user_id="app-1")
+    payload = issue_payload("ENG-9", was_state="s-working", now_state="s-done")
+    payload["data"]["id"] = "issue-ENG-9"
+
+    line = await sync.handle_issue_webhook(payload)
+
+    assert line.endswith("archived 0")
+
+
+async def test_no_app_user_id_means_no_waiters(boards):
+    sync = KanbanSync(FakeClient(), wake=lambda *a: None)
+
+    assert sync._waiters is None
+
+
+async def test_start_adds_the_waiter_loop_only_with_an_app_user_id(boards, idle_watch, tmp_path):
+    boards.cursors[BOARD] = 0
+    plain = KanbanSync(FakeClient(), boards_root=tmp_path / "b", reconcile_seconds=60, wake=lambda *a: None)
+    waiter = KanbanSync(
+        FakeClient(),
+        boards_root=tmp_path / "b",
+        reconcile_seconds=60,
+        wake=lambda *a: None,
+        app_user_id="app-1",
+        waiter_seconds=3600,
+    )
+    all_tasks: list[asyncio.Task[None]] = []
+    try:
+        plain_tasks = plain.start()
+        waiter_tasks = waiter.start()
+        all_tasks = [*plain_tasks, *waiter_tasks]
+        assert len(plain_tasks) == 2
+        assert len(waiter_tasks) == 3
+    finally:
+        for task in all_tasks:
+            task.cancel()
+        await asyncio.gather(
+            *all_tasks, *plain._followers.values(), *waiter._followers.values(), return_exceptions=True
+        )
+
+
+async def test_has_open_card_looks_at_every_board(cli):
+    cli.slugs = ["a", "b"]
+    cli.cards_by[("b", "ENG-5")] = [card("t1", "ready")]
+    sync = KanbanSync(FakeClient())
+
+    assert await sync._has_open_card("ENG-5") is True
+    assert await sync._has_open_card("ENG-6") is False

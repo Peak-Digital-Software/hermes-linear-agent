@@ -1250,3 +1250,50 @@ async def test_non_unblocked_app_user_notifications_are_still_ignored():
     assert response["status"] == "ignored"
     assert wakes == []
     assert not any(call[0] == "get_issue" for call in client.calls)
+
+
+@pytest.mark.asyncio
+async def test_issue_unblocked_wakes_a_delegated_grandparent():
+    """Neither the issue nor its parent is delegated: the waiters' ancestor lookup finds the grandparent."""
+    from hermes_linear_agent.waiters import Waiters
+
+    client = _FakeLinearClient()
+    client.issues["issue-1"] = {
+        "id": "issue-1",
+        "identifier": "ENG-2263",
+        "delegate": None,
+        "parent": {"id": "issue-parent", "identifier": "ENG-100", "delegate": None},
+    }
+
+    async def execute(query, variables=None):
+        return {
+            "issue": {
+                "id": "issue-1",
+                "identifier": "ENG-2263",
+                "delegate": None,
+                "parent": {
+                    "id": "issue-parent",
+                    "identifier": "ENG-100",
+                    "delegate": None,
+                    "parent": {"id": "issue-gp", "identifier": "ENG-50", "delegate": {"id": "app-1"}},
+                },
+            }
+        }
+
+    client.execute = execute
+    adapter = _make_adapter(client=client, extra={"app_user_id": "app-1", "allow_all_users": True})
+    wakes = _record_wakes(adapter)
+
+    async def no_cards(_key):
+        return False
+
+    class _Sync:
+        _waiters = Waiters(client, "app-1", lambda *a: None, no_cards)
+
+    adapter._kanban = _Sync()
+
+    response, status = await _post(adapter, _unblocked_app_payload(), delivery_id="evt-unblocked")
+
+    assert status == 200
+    assert response == {"status": "woken", "issue": "ENG-50"}
+    assert wakes == [("issue-gp", "ENG-50", "[sync] ENG-2263 unblocked.")]
