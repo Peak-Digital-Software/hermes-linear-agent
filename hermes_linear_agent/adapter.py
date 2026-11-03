@@ -518,6 +518,7 @@ def _apply_yaml_config(yaml_cfg: dict, platform_cfg: dict) -> dict[str, Any] | N
         "auth_path",
         "max_body_bytes",
         "kanban_sync",
+        "kanban_pr_gh",
         "issue_webhook_secret",
     ):
         if key in platform_cfg:
@@ -680,6 +681,9 @@ class LinearAgentAdapter(BasePlatformAdapter):
         # agent-session traffic and issue data never share an authorization
         # path. Unset issue secret = the route fails closed (401).
         self._kanban_sync = _bool_opt(extra, "kanban_sync", "LINEAR_AGENT_KANBAN_SYNC", False)
+        self._kanban_pr_gh = (
+            str(extra.get("kanban_pr_gh") or _str_env("LINEAR_AGENT_KANBAN_PR_GH") or "").strip() or None
+        )
         self._issue_webhook_secret = str(
             extra.get("issue_webhook_secret") or _str_env("LINEAR_ISSUE_WEBHOOK_SECRET") or ""
         ).strip()
@@ -892,7 +896,8 @@ class LinearAgentAdapter(BasePlatformAdapter):
         sync_cls = _kanban_sync_class()
         # The sync wakes sessions through this adapter's dispatcher: a wake is
         # a real turn on the issue's Hermes session, not a webhook delivery.
-        sync = sync_cls(self._client, wake=self._dispatch_wake)
+        pr_opts = {"pr_gh": self._kanban_pr_gh} if self._kanban_pr_gh else {}
+        sync = sync_cls(self._client, wake=self._dispatch_wake, **pr_opts)
         self._kanban = sync
         for task in sync.start():
             self._background_tasks.add(task)

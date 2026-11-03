@@ -31,7 +31,7 @@ from typing import Any
 
 import watchfiles
 
-from . import kanban_cli
+from . import kanban_cli, pr_reconcile
 from .kanban_rules import (
     ACTED,
     CLOSED_TYPES,
@@ -175,10 +175,14 @@ class KanbanSync:
         wake: Callable[[str, str, str], None] | None = None,
         boards_root: Path | None = None,
         reconcile_seconds: float = RECONCILE_SECONDS,
+        pr_gh: str | None = None,
+        pr_seconds: float = 900.0,
     ) -> None:
         self._client = client
         self.team_keys = tuple(team_keys)
         self.reconcile_seconds = reconcile_seconds
+        self.pr_gh = pr_gh
+        self.pr_seconds = pr_seconds
         self._wake = wake
         self.boards_root = Path(boards_root) if boards_root is not None else Path.home() / ".hermes/kanban/boards"
 
@@ -190,6 +194,7 @@ class KanbanSync:
         self._followers: dict[str, asyncio.Task[None]] = {}
         self._discovery_task: asyncio.Task[None] | None = None
         self._reconcile_task: asyncio.Task[None] | None = None
+        self._pr_task: asyncio.Task[None] | None = None
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -197,7 +202,11 @@ class KanbanSync:
         """Start board discovery and the reconcile loop; one task each."""
         self._discovery_task = asyncio.create_task(self._discover_loop())
         self._reconcile_task = asyncio.create_task(self._reconcile_loop())
-        return [self._discovery_task, self._reconcile_task]
+        tasks = [self._discovery_task, self._reconcile_task]
+        if self.pr_gh:
+            self._pr_task = asyncio.create_task(self._pr_loop())
+            tasks.append(self._pr_task)
+        return tasks
 
     async def _discover_loop(self) -> None:
         """Follow every board, re-listing them whenever the boards root changes."""
@@ -415,6 +424,16 @@ class KanbanSync:
             except Exception as error:  # noqa: BLE001 - a failed pass must not kill the timer
                 logger.error("reconcile failed: %s", _message(error))
             await asyncio.sleep(self.reconcile_seconds)
+
+    async def _pr_loop(self) -> None:
+        while True:
+            try:
+                await pr_reconcile.reconcile_prs(gh=str(self.pr_gh))
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # noqa: BLE001 - a failed pass must not kill the timer
+                logger.error("pr reconcile failed: %s", _message(error))
+            await asyncio.sleep(self.pr_seconds)
 
     async def reconcile(self) -> int:
         """One pass: mirror every active issue's card-set status; returns writes."""
