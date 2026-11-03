@@ -1,0 +1,84 @@
+{
+  "type": "AgentSessionEvent",
+  "action": "created",
+  "createdAt": "2026-11-03T06:57:02.112Z",
+  "organizationId": "73dc716b-216c-4127-b078-0235cb85978f",
+  "oauthClientId": "0814834a50b5f02fb7e181ad1acfbc8d",
+  "appUserId": "21d33d4d-d1f5-4348-9dfb-29e46df5156a",
+  "agentSession": {
+    "id": "84d110f9-1f0f-49e0-a6e4-44629d48acf7",
+    "createdAt": "2026-11-03T06:57:01.329Z",
+    "updatedAt": "2026-11-03T06:57:01.329Z",
+    "archivedAt": null,
+    "creatorId": null,
+    "appUserId": "21d33d4d-d1f5-4348-9dfb-29e46df5156a",
+    "commentId": "d06085b3-8cc7-414c-9a7c-fd1af9cf1375",
+    "sourceCommentId": null,
+    "issueId": "7aea2c82-bba2-4a69-a041-df875d3fbe19",
+    "pullRequestId": null,
+    "slugId": "94ddf992d1600",
+    "status": "pending",
+    "startedAt": null,
+    "endedAt": null,
+    "dismissedAt": null,
+    "dismissedById": null,
+    "externalLink": null,
+    "summary": null,
+    "sourceMetadata": null,
+    "modelSelection": null,
+    "plan": null,
+    "workspaceDiff": null,
+    "context": [],
+    "url": "https://linear.app/peak-software-development/agent-session/84d110f9-1f0f-49e0-a6e4-44629d48acf7",
+    "externalUrls": [],
+    "organizationId": "73dc716b-216c-4127-b078-0235cb85978f",
+    "comment": {
+      "id": "d06085b3-8cc7-414c-9a7c-fd1af9cf1375",
+      "body": "This thread is for an agent session with gilfoyle.",
+      "issueId": "7aea2c82-bba2-4a69-a041-df875d3fbe19"
+    },
+    "issue": {
+      "id": "7aea2c82-bba2-4a69-a041-df875d3fbe19",
+      "title": "Error: SUPABASE_JWT_SECRET is not set",
+      "teamId": "83fc98a4-ee84-41fe-8ef2-9dc6c714ea83",
+      "team": {
+        "id": "83fc98a4-ee84-41fe-8ef2-9dc6c714ea83",
+        "key": "ENG",
+        "name": "Engineering"
+      },
+      "identifier": "ENG-2371",
+      "url": "https://linear.app/peak-software-development/issue/ENG-2371/error-supabase-jwt-secret-is-not-set"
+    }
+  },
+  "agentActivity": {
+    "id": "b346e71c-9fcf-4e22-9453-0567fae664b9",
+    "createdAt": "2026-11-03T06:57:01.329Z",
+    "updatedAt": "2026-11-03T06:57:01.329Z",
+    "archivedAt": null,
+    "agentSessionId": "84d110f9-1f0f-49e0-a6e4-44629d48acf7",
+    "sourceCommentId": "d06085b3-8cc7-414c-9a7c-fd1af9cf1375",
+    "userId": "21d33d4d-d1f5-4348-9dfb-29e46df5156a",
+    "sourceMetadata": null,
+    "executionSkippedReason": null,
+    "signal": null,
+    "ephemeral": false,
+    "pushSummary": null,
+    "queued": false,
+    "sentAt": null,
+    "signalMetadata": null,
+    "content": {
+      "type": "prompt",
+      "body": "Work on [ENG-2371](https://linear.app/peak-software-development/issue/ENG-2371/error-supabase-jwt-secret-is-not-set)"
+    },
+    "user": {
+      "id": "21d33d4d-d1f5-4348-9dfb-29e46df5156a",
+      "name": "Gilfoyle",
+      "url": "https://linear.app/peak-software-development/profiles/gilfoyle"
+    }
+  },
+  "previousComments": null,
+  "guidance": null,
+  "promptContext": "<issue identifier=\"ENG-2371\">\n<title>Error: SUPABASE_JWT_SECRET is not set</title>\n<team name=\"Engineering\"/>\n<label>Type \u203a Bug</label>\n</issue>\n\n<user-request>\nWork on [ENG-2371](https://linear.app/peak-software-development/issue/ENG-2371/error-supabase-jwt-secret-is-not-set)\n</user-request>",
+  "webhookTimestamp": 1793689022133,
+  "webhookId": "b327f612-e173-4f15-ba5e-d61f4fc1bd67"
+}

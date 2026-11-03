@@ -11,6 +11,7 @@ import hashlib
 import hmac
 import json
 import time
+from pathlib import Path
 
 import pytest
 from gateway.config import PlatformConfig
@@ -1017,6 +1018,84 @@ async def test_prompted_self_echo_is_still_refused_even_with_an_allowed_issue_cr
 
     assert status == 403
     assert events == []
+
+
+# ENG-2375 — an issue filed by an integration (Sentry) has no human creator;
+# the live ENG-2371 delivery is the fixture.
+_SENTRY_APP_ID = "21d33d4d-d1f5-4348-9dfb-29e46df5156a"
+_SENTRY_TOM_ID = "d9c67fb5-7038-4b32-a266-0e8a1c379be4"
+_SENTRY_ISSUE_ID = "7aea2c82-bba2-4a69-a041-df875d3fbe19"
+
+
+def _sentry_payload():
+    path = Path(__file__).parent / "fixtures" / "agent_session_created_sentry_issue.json"
+    return json.loads(path.read_text())
+
+
+async def _post_sentry(adapter):
+    raw = _body(_sentry_payload())
+    return await adapter.handle_webhook(_headers(raw, delivery_id="evt-sentry"), raw)
+
+
+def _sentry_adapter(client):
+    return _make_adapter(
+        client=client,
+        extra={"app_user_id": _SENTRY_APP_ID, "allow_all_users": False, "allowed_users": [_SENTRY_TOM_ID]},
+    )
+
+
+@pytest.mark.asyncio
+async def test_sentry_filed_issue_without_a_creator_takes_its_sender_from_the_assignee():
+    client = _FakeLinearClient()
+    client.issue_creators[_SENTRY_ISSUE_ID] = ""
+    client.issues[_SENTRY_ISSUE_ID] = {"id": _SENTRY_ISSUE_ID, "assignee": {"id": _SENTRY_TOM_ID, "name": "Tom"}}
+    adapter = _sentry_adapter(client)
+    events = await _capture_events(adapter)
+
+    context = await adapter._resolve_sender(extract_context(_sentry_payload(), {}))
+    assert context.actor_user_id == _SENTRY_TOM_ID
+    assert context.sender_source == "issue_assignee"
+
+    _, status = await _post_sentry(adapter)
+    await _settle()
+
+    assert status == 200
+    assert [event.source.user_id for event in events] == [_SENTRY_TOM_ID]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("assignee", [None, {"id": _SENTRY_APP_ID, "name": "Hermes"}])
+async def test_sentry_filed_issue_without_a_usable_assignee_is_refused(assignee):
+    client = _FakeLinearClient()
+    issue = {"id": _SENTRY_ISSUE_ID}
+    if assignee:
+        issue["assignee"] = assignee
+    client.issues[_SENTRY_ISSUE_ID] = issue
+    adapter = _sentry_adapter(client)
+    events = await _capture_events(adapter)
+
+    context = await adapter._resolve_sender(extract_context(_sentry_payload(), {}))
+    assert context.actor_user_id == ""
+    assert context.sender_source == ""
+
+    _, status = await _post_sentry(adapter)
+    await _settle()
+
+    assert status == 403
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_failed_creator_lookup_does_not_fall_back_to_the_assignee():
+    client = _FakeLinearClient()
+    client.issue_creator_error = RuntimeError("linear is down")
+    client.issues[_SENTRY_ISSUE_ID] = {"id": _SENTRY_ISSUE_ID, "assignee": {"id": _SENTRY_TOM_ID}}
+    adapter = _sentry_adapter(client)
+
+    _, status = await _post_sentry(adapter)
+
+    assert status == 403
+    assert ("get_issue", _SENTRY_ISSUE_ID) not in client.calls
 
 
 # ---------------------------------------------------------------------------
