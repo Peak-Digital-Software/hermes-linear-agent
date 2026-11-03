@@ -43,6 +43,7 @@ from .kanban_rules import (
     team_state_name,
     transition,
 )
+from .waiters import Waiters
 
 logger = logging.getLogger(__name__)
 
@@ -177,6 +178,8 @@ class KanbanSync:
         reconcile_seconds: float = RECONCILE_SECONDS,
         pr_gh: str | None = None,
         pr_seconds: float = 900.0,
+        app_user_id: str = "",
+        waiter_seconds: float = 900.0,
     ) -> None:
         self._client = client
         self.team_keys = tuple(team_keys)
@@ -184,6 +187,10 @@ class KanbanSync:
         self.pr_gh = pr_gh
         self.pr_seconds = pr_seconds
         self._wake = wake
+        self.waiter_seconds = waiter_seconds
+        self._waiters: Waiters | None = (
+            Waiters(client, app_user_id, wake, self._has_open_card) if app_user_id and wake is not None else None
+        )
         self.boards_root = Path(boards_root) if boards_root is not None else Path.home() / ".hermes/kanban/boards"
 
         # state id -> workflow state type, resolved once per process
@@ -195,6 +202,7 @@ class KanbanSync:
         self._discovery_task: asyncio.Task[None] | None = None
         self._reconcile_task: asyncio.Task[None] | None = None
         self._pr_task: asyncio.Task[None] | None = None
+        self._waiter_task: asyncio.Task[None] | None = None
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -206,6 +214,9 @@ class KanbanSync:
         if self.pr_gh:
             self._pr_task = asyncio.create_task(self._pr_loop())
             tasks.append(self._pr_task)
+        if self._waiters is not None:
+            self._waiter_task = asyncio.create_task(self._waiter_loop())
+            tasks.append(self._waiter_task)
         return tasks
 
     async def _discover_loop(self) -> None:
@@ -425,6 +436,27 @@ class KanbanSync:
                 logger.error("reconcile failed: %s", _message(error))
             await asyncio.sleep(self.reconcile_seconds)
 
+    async def _waiter_loop(self) -> None:
+        while True:
+            try:
+                if self._waiters is not None:
+                    await self._waiters.reconcile(self.team_keys)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # noqa: BLE001 - a failed pass must not kill the timer
+                logger.error("waiter reconcile failed: %s", _message(error))
+            await asyncio.sleep(self.waiter_seconds)
+
+    async def _has_open_card(self, issue_key: str) -> bool:
+        """True when any board holds an open card for the issue."""
+        for row in await kanban_cli.boards():
+            board = row.get("slug")
+            if not board:
+                continue
+            if any(is_open(card) for card in await kanban_cli.cards(board, issue_key)):
+                return True
+        return False
+
     async def _pr_loop(self) -> None:
         while True:
             try:
@@ -507,6 +539,13 @@ class KanbanSync:
             return _routed(payload, "ignored: no card action")
 
         key = data.get("identifier") or ""
+        if now_type in ("completed", "canceled") and was_type != now_type and self._waiters is not None:
+            try:
+                await self._waiters.on_blocker_closed(str(data.get("id") or ""))
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # noqa: BLE001 - never fail the webhook
+                logger.warning("warn: waiters %s: %s", key, _err_line(error))
         if now_type == "completed":
             await self._wake_parent(data, key)
 

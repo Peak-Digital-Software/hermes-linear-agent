@@ -52,10 +52,11 @@ class _FakeKanbanSync:
 
     instances: list["_FakeKanbanSync"] = []
 
-    def __init__(self, client, team_key="ENG", *, wake=None):
+    def __init__(self, client, team_key="ENG", *, wake=None, app_user_id=""):
         self.client = client
         self.team_key = team_key
         self.wake = wake
+        self.app_user_id = app_user_id
         self.payloads: list[dict] = []
         self.tasks: list[asyncio.Task] = []
         self.started = False

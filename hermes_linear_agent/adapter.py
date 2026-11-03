@@ -897,6 +897,8 @@ class LinearAgentAdapter(BasePlatformAdapter):
         # The sync wakes sessions through this adapter's dispatcher: a wake is
         # a real turn on the issue's Hermes session, not a webhook delivery.
         pr_opts = {"pr_gh": self._kanban_pr_gh} if self._kanban_pr_gh else {}
+        if self._app_user_id:
+            pr_opts["app_user_id"] = self._app_user_id
         sync = sync_cls(self._client, wake=self._dispatch_wake, **pr_opts)
         self._kanban = sync
         for task in sync.start():
@@ -1666,6 +1668,19 @@ class LinearAgentAdapter(BasePlatformAdapter):
             self._dispatch_wake(parent_id, parent_key, text)
             logger.info("[linear_agent] Woke parent %s after issueUnblocked on %s", parent_key, key)
             return {"status": "woken", "issue": parent_key}, 200
+
+        waiters = getattr(self._kanban, "_waiters", None)
+        if waiters is not None:
+            try:
+                target = await waiters.nearest_for(issue_id)
+            except Exception as exc:  # noqa: BLE001 - best-effort
+                logger.warning("[linear_agent] issueUnblocked: ancestor lookup for %s failed (%s)", key, exc)
+                target = None
+            if target:
+                target_id, target_key = target
+                self._dispatch_wake(target_id, target_key, text)
+                logger.info("[linear_agent] Woke ancestor %s after issueUnblocked on %s", target_key, key)
+                return {"status": "woken", "issue": target_key}, 200
 
         logger.info(
             "[linear_agent] issueUnblocked for %s ignored: not delegated to this app",
