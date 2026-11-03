@@ -322,3 +322,75 @@ def test_save_cursor_recovers_from_a_corrupt_file(state_dir, tmp_path):
 def test_cursor_defaults_to_the_linear_agent_state_dir(monkeypatch, tmp_path):
     monkeypatch.delenv("PEAK_AGENT_STATE_DIR", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
+
+
+class BodyFileExec(FakeExec):
+    """FakeExec that also reads the --body-file while the call is in flight."""
+
+    def __init__(self, *answers: str | Exception) -> None:
+        super().__init__(*answers)
+        self.bodies: list[str] = []
+        self.paths: list[str] = []
+
+    async def __call__(self, *args, **kwargs):
+        argv = list(args[1:])
+        if "--body-file" in argv:
+            path = argv[argv.index("--body-file") + 1]
+            self.paths.append(path)
+            self.bodies.append(Path(path).read_text(encoding="utf-8"))
+        return await super().__call__(*args, **kwargs)
+
+
+def _create_kwargs() -> dict:
+    return {
+        "body": "line one\nline two ✓",
+        "assignee": "oracle",
+        "tenant": "ENG-1",
+        "idempotency_key": "oracle/repo#7@abc",
+        "workspace": "worktree:/tmp/clone",
+    }
+
+
+async def test_create_exact_argv_body_file_and_id(monkeypatch):
+    fake = BodyFileExec((FIXTURES / "create.json").read_text())
+    monkeypatch.setattr(kanban_cli.asyncio, "create_subprocess_exec", fake)
+
+    result = await kanban_cli.create("engineering", "Oracle: review", **_create_kwargs())
+
+    assert result == "t_a9e262c3"
+    path = fake.paths[0]
+    assert fake.calls == [
+        [
+            "kanban",
+            "--board",
+            "engineering",
+            "create",
+            "Oracle: review",
+            "--body-file",
+            path,
+            "--assignee",
+            "oracle",
+            "--tenant",
+            "ENG-1",
+            "--idempotency-key",
+            "oracle/repo#7@abc",
+            "--workspace",
+            "worktree:/tmp/clone",
+            "--completion-contract",
+            "local-only",
+            "--json",
+        ]
+    ]
+    assert fake.bodies == ["line one\nline two ✓"]
+    assert not os.path.exists(path)
+
+
+async def test_create_removes_temp_file_on_error(monkeypatch):
+    fake = BodyFileExec(FakeProc("", "boom", 1))
+    monkeypatch.setattr(kanban_cli.asyncio, "create_subprocess_exec", fake)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await kanban_cli.create("engineering", "t", **_create_kwargs())
+
+    assert fake.paths
+    assert not os.path.exists(fake.paths[0])

@@ -20,6 +20,7 @@ import contextlib
 import json
 import os
 import sqlite3
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -99,6 +100,54 @@ async def show(board: str, task_id: str) -> dict:
         "tenant": task.get("tenant"),
         "completed": task.get("completed_at") is not None,
     }
+
+
+async def create(
+    board: str,
+    title: str,
+    *,
+    body: str,
+    assignee: str,
+    tenant: str,
+    idempotency_key: str,
+    workspace: str,
+    completion_contract: str = "local-only",
+) -> str:
+    """Create (or, same key, return) a card; returns its id.
+
+    The body goes through a temp file and ``--body-file``; the file is removed
+    after the call, also on error.
+    """
+    with tempfile.NamedTemporaryFile("w", suffix=".md", encoding="utf-8", delete=False) as handle:
+        handle.write(body)
+        path = handle.name
+    try:
+        out = await _exec(
+            [
+                "kanban",
+                "--board",
+                board,
+                "create",
+                title,
+                "--body-file",
+                path,
+                "--assignee",
+                assignee,
+                "--tenant",
+                tenant,
+                "--idempotency-key",
+                idempotency_key,
+                "--workspace",
+                workspace,
+                "--completion-contract",
+                completion_contract,
+                "--json",
+            ]
+        )
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+    return str(json.loads(out)["id"])
 
 
 async def archive(board: str, ids: list[str]) -> None:
