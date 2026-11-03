@@ -2016,7 +2016,8 @@ class LinearAgentAdapter(BasePlatformAdapter):
         Linear's machine prompt on a ``created`` session), then
         ``agentSession.creatorId``, then the session comment's author
         (payload field, else a Linear lookup), then the issue's creator
-        (payload field, else a Linear lookup).
+        (payload field, else a Linear lookup), then, when the issue has no
+        human creator or the creator is this app, the issue's assignee.
 
         Linear leaves the session creator null both for machine handoffs
         (another agent app is the real sender, readable from the session's
@@ -2030,6 +2031,7 @@ class LinearAgentAdapter(BasePlatformAdapter):
 
         sender = str(context.actor_user_id or "").strip()
         source = context.sender_source or ("agentActivity.userId" if sender else "")
+        app_author_cleared = False
         if (
             sender
             and context.action == "created"
@@ -2048,6 +2050,7 @@ class LinearAgentAdapter(BasePlatformAdapter):
                 context.agent_session_id,
             )
             sender, source = "", ""
+            app_author_cleared = True
 
         if not sender:
             sender, source = str(context.session_creator_id or "").strip(), "agentSession.creatorId"
@@ -2075,6 +2078,8 @@ class LinearAgentAdapter(BasePlatformAdapter):
                 "[linear_agent] Session %s names no sender (activity, creator, comment and issue creator all unresolved); refusing",
                 context.agent_session_id,
             )
+            if app_author_cleared:
+                return replace(context, actor_user_id="", sender_source="")
             return context
         logger.info(
             "[linear_agent] Session %s sender resolved to %s from %s",
@@ -2089,8 +2094,10 @@ class LinearAgentAdapter(BasePlatformAdapter):
 
         The agent-session payload serializes the issue without its creator, so
         this normally costs one GraphQL lookup. A creator that is this app
-        itself is not a sender: leave it empty so authorization fails closed
-        instead of accepting the app's own id.
+        itself, or an empty creator (filed by an integration), is not a
+        sender: fall back to the issue's assignee (source ``issue_assignee``).
+        A failed creator lookup, or an assignee that is empty or this app,
+        yields ``("", "")`` so authorization fails closed.
         """
         issue_id = str(context.issue_id or "").strip()
         if not issue_id:
@@ -2107,13 +2114,12 @@ class LinearAgentAdapter(BasePlatformAdapter):
                     exc,
                 )
                 return "", ""
-        if not creator_id:
-            return "", ""
-        if not self._app_user_id or creator_id != self._app_user_id:
+        if creator_id and (not self._app_user_id or creator_id != self._app_user_id):
             return creator_id, "issue.creatorId"
-        # The creator is this app (an issue the agent filed or an app-created
-        # delegation): our own id is never a sender. The assignee is the human
-        # the work is for, so fall back to it — the allowlist still decides.
+        # No human creator (filed by an integration or automation, so the
+        # creator is empty) or the creator is this app (an issue the agent
+        # filed): our own id is never a sender. The assignee is the human the
+        # work is for, so fall back to it — the allowlist still decides.
         try:
             issue = await self._client.get_issue(id=issue_id)
         except Exception as exc:  # noqa: BLE001 - unresolved sender must stay unauthorized
@@ -2126,7 +2132,7 @@ class LinearAgentAdapter(BasePlatformAdapter):
             return "", ""
         assignee = issue.get("assignee") if isinstance(issue, dict) else None
         assignee_id = str(((assignee or {}).get("id")) or "").strip()
-        if not assignee_id:
+        if not assignee_id or (self._app_user_id and assignee_id == self._app_user_id):
             return "", ""
         return assignee_id, "issue_assignee"
 
