@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 
 from hermes_linear_agent import github_prs, pr_proof
 from hermes_linear_agent.github_prs import OpenPr
@@ -32,6 +33,10 @@ class Fakes:
         self.by_key: dict[str, str] = {}
         self.creates: list[tuple] = []
         self.titles: dict[str, str] = {}
+        self.dead: set[str] = set()
+
+    async def issue_live(self, key):
+        return key not in self.dead
 
     async def repos(self, gh, org):
         return {f"{org}/{name}": flag for name, flag in self.production.items()}
@@ -76,6 +81,7 @@ class Fakes:
     async def run(self):
         return await pr_proof.reconcile_proofs(
             gh="gh",
+            issue_live=self.issue_live,
             list_cards=self.list_cards,
             create=self.create,
             repos=self.repos,
@@ -170,11 +176,34 @@ async def test_failing_repo_does_not_stop_another():
     assert f.creates[0][2]["tenant"] == "ENG-100"
 
 
-async def test_pr_without_issue_key_says_post_on_pr_only():
-    f = Fakes({"alpha": [_pr(title="no key here")]}, files={("alpha", 7): ["a.tsx"]})
-    await f.run()
-    assert f.creates[0][2]["tenant"] == "proof:alpha"
-    assert "none: PR has no issue key, block" in f.creates[0][2]["body"]
+async def test_pr_without_live_issue_is_skipped_and_the_next_pr_still_cards():
+    f = Fakes(
+        {"alpha": [_pr(title="no key here", number=7), _pr(title="ENG-200 gone", number=8)]},
+        files={("alpha", 7): ["a.tsx"], ("alpha", 8): ["b.tsx"]},
+    )
+    f.dead.add("ENG-200")
+    assert await f.run() == []
+    assert f.creates == []
+    f.prs_by_repo["alpha"].append(_pr(title="ENG-100 live", number=9))
+    assert await f.run() == ["t_1"]  # skips continue, they do not break
+    assert f.creates[0][2]["tenant"] == "ENG-100"
+    assert "Issue: ENG-100" in f.creates[0][2]["body"]
+
+
+async def test_skip_is_reported_once_per_head_sha(caplog):
+    pr_proof._reported.clear()
+    f = Fakes({"alpha": [_pr(title="ENG-200 gone", sha="c" * 40)]})
+    f.dead.add("ENG-200")
+    with caplog.at_level(logging.WARNING, logger=pr_proof.logger.name):
+        await f.run()
+        await f.run()
+    skips = [r for r in caplog.records if "pr proof: skip" in r.getMessage()]
+    assert len(skips) == 1
+    assert "ENG-200 archived, trashed or missing" in skips[0].getMessage()
+    f.prs_by_repo["alpha"] = [_pr(title="ENG-200 gone", sha="d" * 40)]
+    with caplog.at_level(logging.WARNING, logger=pr_proof.logger.name):
+        await f.run()
+    assert len([r for r in caplog.records if "pr proof: skip" in r.getMessage()]) == 2
 
 
 # --- github_prs additions ---------------------------------------------------
@@ -252,6 +281,7 @@ async def test_repo_with_open_verify_card_is_skipped():
     assert (
         await pr_proof.reconcile_proofs(
             gh="gh",
+            issue_live=f.issue_live,
             list_cards=f.list_cards,
             create=f.create,
             repos=f.repos,

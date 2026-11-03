@@ -20,6 +20,7 @@ import pytest
 import watchfiles
 
 from hermes_linear_agent import kanban_cli, kanban_sync
+from hermes_linear_agent.client import LinearApiError
 from hermes_linear_agent.kanban_rules import Card
 from hermes_linear_agent.kanban_sync import KanbanSync
 
@@ -1107,7 +1108,7 @@ async def test_the_pr_loop_calls_reconcile_proofs_only_when_the_flag_is_on(monke
         reviews.append(gh)
         return []
 
-    async def proof(*, gh):
+    async def proof(*, gh, issue_live):
         proofs.append(gh)
         return []
 
@@ -1781,3 +1782,39 @@ async def test_has_open_card_looks_at_every_board(cli):
 
     assert await sync._has_open_card("ENG-5") is True
     assert await sync._has_open_card("ENG-6") is False
+
+
+class _ExecClient:
+    def __init__(self, result=None, error=None):
+        self.result, self.error = result, error
+
+    async def execute(self, query, variables=None):
+        if self.error:
+            raise self.error
+        return self.result
+
+
+@pytest.mark.parametrize(
+    ("result", "error", "expected"),
+    [
+        ({"issue": {"id": "i", "archivedAt": None, "trashed": None}}, None, True),
+        ({"issue": {"id": "i", "archivedAt": "2026-01-01T00:00:00Z", "trashed": None}}, None, False),
+        ({"issue": {"id": "i", "archivedAt": None, "trashed": True}}, None, False),
+        ({"issue": None}, None, False),
+        (None, LinearApiError("Linear GraphQL errors: Entity not found: Issue"), False),
+        (
+            None,
+            LinearApiError('Linear GraphQL HTTP 400: {"errors":[{"message":"Entity not found: Issue"}]}'),
+            False,
+        ),
+    ],
+)
+async def test_issue_live(result, error, expected):
+    sync = KanbanSync(_ExecClient(result, error))
+    assert await sync._issue_live("ENG-1") is expected
+
+
+async def test_issue_live_reraises_other_linear_errors():
+    sync = KanbanSync(_ExecClient(error=LinearApiError("Linear GraphQL HTTP 500: boom")))
+    with pytest.raises(LinearApiError):
+        await sync._issue_live("ENG-1")

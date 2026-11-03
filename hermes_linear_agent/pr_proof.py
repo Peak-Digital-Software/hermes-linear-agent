@@ -2,18 +2,23 @@
 
 Kept apart from ``pr_reconcile`` so that module stays Oracle-only. Verifies are serialised
 per repo (previews share ports): a repo with an open Verify card gets nothing new this
-pass, and at most one new card per repo per pass. A PR whose title carries an issue key is
-carded under that key so the status rules see it; otherwise under ``proof:<repo>``.
+pass, and at most one new card per repo per pass. A PR is carded under the issue key in its
+title so the status rules see it. A PR with no issue key, or whose issue is archived, trashed
+or missing, is skipped and reported once per head sha; a human hand-cards those (skill
+build-cards).
 """
 
 from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Awaitable, Callable
 
 from . import github_prs, kanban_cli
 
 logger = logging.getLogger(__name__)
+
+_reported: set[str] = set()
 
 UI_EXT = (".tsx", ".jsx", ".css", ".html")
 UI_SEGMENTS = ("app", "components")
@@ -51,12 +56,7 @@ def classify(files: list[tuple[str, str]]) -> list[str]:
     return modes or ["logic"]
 
 
-def proof_tenant(repo: str) -> str:
-    return f"proof:{repo}"
-
-
 def proof_body(pr: github_prs.OpenPr, key: str, repo: str, modes: list[str]) -> str:
-    issue = key or "none: PR has no issue key, block"
     return f"""Follow skill visual-proof.
 
 Mode: {", ".join(modes)}
@@ -64,7 +64,7 @@ Repo: {repo}
 PR: {pr.full_name}#{pr.number} ({pr.url})
 Branch: {pr.branch}
 Head sha: {pr.head_sha}
-Issue: {issue}
+Issue: {key}
 
 Bring up the branch preview: `peak-preview up {repo} --ref {pr.branch} --json`.
 
@@ -72,9 +72,19 @@ Complete with metadata `{{"evidence_url": <URL of the Linear comment carrying th
 """
 
 
+def _report(repo: str, pr: github_prs.OpenPr, reason: str) -> None:
+    """Log a skipped PR the first time its (repo, number, head sha) is seen."""
+    seen = PROOF_KEY.format(repo=repo, number=pr.number, sha=pr.head_sha)
+    if seen in _reported:
+        return
+    _reported.add(seen)
+    logger.warning("pr proof: skip %s#%s @ %s: %s", repo, pr.number, pr.head_sha[:7], reason)
+
+
 async def reconcile_proofs(
     *,
     gh: str,
+    issue_live: Callable[[str], Awaitable[bool]],
     org: str = "Peak-Digital-Software",
     board: str = "engineering",
     list_cards=kanban_cli.cards,
@@ -100,18 +110,23 @@ async def reconcile_proofs(
             if any(str(card.get("title", "")).startswith(prefix) for card in await open_cards(board, VERIFY_ASSIGNEE)):
                 continue
             for pr in sorted(await prs(gh, full_name), key=lambda p: p.number):
-                modes = classify(await files(gh, full_name, pr.number))
                 match = _ISSUE_RE.search(pr.title or "")
                 key = match.group(0) if match else ""
-                tenant = key or proof_tenant(repo)
-                known = {card.id for card in await list_cards(board, tenant)}
+                if not key:
+                    _report(repo, pr, "no issue key")
+                    continue
+                if not await issue_live(key):
+                    _report(repo, pr, f"{key} archived, trashed or missing")
+                    continue
+                modes = classify(await files(gh, full_name, pr.number))
+                known = {card.id for card in await list_cards(board, key)}
                 card_id = await create(
                     board,
                     f"Verify: {repo}#{pr.number} @ {pr.head_sha[:7]}",
                     body=proof_body(pr, key, repo, modes),
                     assignee=VERIFY_ASSIGNEE,
                     skills=["visual-proof"],
-                    tenant=tenant,
+                    tenant=key,
                     idempotency_key=PROOF_KEY.format(repo=repo, number=pr.number, sha=pr.head_sha),
                     workspace="scratch",
                     completion_contract="local-only",
