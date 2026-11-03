@@ -22,12 +22,14 @@ _CANCEL_TYPES: frozenset[str] = frozenset({"canceled", "duplicate"})
 BLOCKED_STATE = "Blocked"
 
 #: Per-team renames of the canonical (ENG) status names; a team not listed uses them as-is.
-TEAM_STATE_NAMES: dict[str, dict[str, str]] = {
-    "OPS": {"Working": "In Progress", "Reviewing": "In Review", "Ready to Merge": "In Review"},
-}
+_OPS_STATE_NAMES = {"Working": "In Progress", "Reviewing": "In Review", "Ready to Merge": "In Review"}
+TEAM_STATE_NAMES: dict[str, dict[str, str]] = {"OPS": _OPS_STATE_NAMES, "ENB": _OPS_STATE_NAMES}
 
 #: States a human sets by hand; the sync never moves an issue out of them.
-HAND_STATES: dict[str, frozenset[str]] = {"OPS": frozenset({"Waiting on client"})}
+HAND_STATES: dict[str, frozenset[str]] = {
+    "OPS": frozenset({"Waiting on client"}),
+    "ENB": frozenset({"Waiting on client"}),
+}
 
 
 def team_state_name(team_key: str | None, status: str) -> str:

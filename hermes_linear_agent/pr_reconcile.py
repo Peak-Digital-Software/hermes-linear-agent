@@ -13,11 +13,11 @@ logger = logging.getLogger(__name__)
 
 ORACLE_KEY = "oracle/{repo}#{number}@{sha}"
 
-_ISSUE_RE = re.compile(r"\b(?:ENG|OPS)-\d+\b")
+_ISSUE_RE = re.compile(r"\b(?:ENG|OPS|ENB)-\d+\b")
 
 
 def tenant_for(pr: github_prs.OpenPr) -> str:
-    """First ENG-<n> or OPS-<n> in the PR title, else ``pr:<repo>#<number>``."""
+    """First ENG-<n>, OPS-<n> or ENB-<n> in the PR title, else ``pr:<repo>#<number>``."""
     match = _ISSUE_RE.search(pr.title or "")
     if match:
         return match.group(0)

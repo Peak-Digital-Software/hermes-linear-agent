@@ -100,6 +100,7 @@ async def test_title_without_key_uses_pr_tenant():
 def test_tenant_for_picks_first_key():
     assert pr_reconcile.tenant_for(_pr(title="OPS-12 then ENG-3")) == "OPS-12"
     assert pr_reconcile.tenant_for(_pr(title="x ENG-5 y")) == "ENG-5"
+    assert pr_reconcile.tenant_for(_pr(title="ENB-12 then ENG-3")) == "ENB-12"
 
 
 async def test_failing_repo_does_not_stop_others():

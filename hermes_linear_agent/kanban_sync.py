@@ -171,7 +171,7 @@ class KanbanSync:
     def __init__(
         self,
         client: Any,
-        team_keys: tuple[str, ...] = ("ENG", "OPS"),
+        team_keys: tuple[str, ...] = ("ENG", "OPS", "ENB"),
         *,
         wake: Callable[[str, str, str], None] | None = None,
         boards_root: Path | None = None,
