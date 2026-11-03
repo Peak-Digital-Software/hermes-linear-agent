@@ -36,6 +36,7 @@ import watchfiles
 
 from . import kanban_cli, pr_reconcile
 from . import pr_proof as pr_proof_module
+from .client import LinearApiError
 from .kanban_rules import (
     ACTED,
     CLOSED_TYPES,
@@ -94,6 +95,8 @@ TEAM_STATES = """query TeamStates($teamId: String!) {
     states(first: 250) { nodes { id name type } }
   }
 }"""
+
+ISSUE_LIVE = """query IssueLive($id: String!) { issue(id: $id) { id archivedAt trashed } }"""
 
 ISSUE_ATTACHMENTS = """query IssueAttachments($id: String!) {
   issue(id: $id) {
@@ -526,7 +529,7 @@ class KanbanSync:
                 logger.error("pr reconcile failed: %s", _message(error))
             if self.pr_proof:
                 try:
-                    await pr_proof_module.reconcile_proofs(gh=str(self.pr_gh))
+                    await pr_proof_module.reconcile_proofs(gh=str(self.pr_gh), issue_live=self._issue_live)
                 except asyncio.CancelledError:
                     raise
                 except Exception as error:  # noqa: BLE001 - a failed pass must not kill the timer
@@ -684,6 +687,17 @@ class KanbanSync:
         data = await self._execute(ISSUE, {"id": issue_key})
         node = data.get("issue")
         return node if isinstance(node, dict) else {}
+
+    async def _issue_live(self, key: str) -> bool:
+        """False for an archived, trashed or missing issue; other errors propagate."""
+        try:
+            data = await self._execute(ISSUE_LIVE, {"id": key})
+        except LinearApiError as error:
+            if "Entity not found" in str(error):
+                return False
+            raise
+        node = data.get("issue")
+        return isinstance(node, dict) and bool(node) and not node.get("archivedAt") and not node.get("trashed")
 
     async def _attachments(self, issue_key: str) -> list[dict[str, Any]]:
         issue = await self._issue(issue_key)
