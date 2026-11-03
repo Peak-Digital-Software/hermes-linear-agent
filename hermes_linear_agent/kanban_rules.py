@@ -25,6 +25,9 @@ BLOCKED_STATE = "Blocked"
 _OPS_STATE_NAMES = {"Working": "In Progress", "Reviewing": "In Review", "Ready to Merge": "In Review"}
 TEAM_STATE_NAMES: dict[str, dict[str, str]] = {"OPS": _OPS_STATE_NAMES, "ENB": _OPS_STATE_NAMES}
 
+#: The assignee of a Verify card (visual proof of a PR).
+VERIFY_ASSIGNEE = "visual-proof"
+
 #: States a human sets by hand; the sync never moves an issue out of them.
 HAND_STATES: dict[str, frozenset[str]] = {
     "OPS": frozenset({"Waiting on client"}),
@@ -84,6 +87,7 @@ class Card:
     assignee: str | None
     completed_at: int | None
     done_when: str | None = None
+    evidence_url: str | None = None
 
 
 def transition(action: str, was_type: str | None, type_: str | None) -> IssueAction:
@@ -156,6 +160,15 @@ def pr_gate(attachments: list[dict]) -> PrState:
     return "merged"
 
 
+def _open_pr_status(cards: list[Card]) -> str:
+    """Row 5 with an open PR: Ready to Merge only on proof from the latest Verify card."""
+    verifies = [card for card in cards if card.assignee == VERIFY_ASSIGNEE and is_completed(card)]
+    if not verifies:
+        return "Reviewing"
+    latest = max(verifies, key=lambda card: card.completed_at or 0)
+    return "Ready to Merge" if latest.evidence_url else BLOCKED_STATE
+
+
 def issue_status(cards: list[Card], attachments: list[dict] | None = None) -> str | None:
     """The issue's Linear status, read from ALL of its cards.
 
@@ -165,7 +178,10 @@ def issue_status(cards: list[Card], attachments: list[dict] | None = None) -> st
     2. any running card -> ``"Working"``
     3. any card in review -> ``"Reviewing"``
     4. every open card is todo/ready/triage -> ``"Todo"``
-    5. every card completed and a PR is open -> ``"Ready to Merge"``
+    5. every card completed and a PR is open -> ``"Ready to Merge"`` only when
+       the latest completed Verify card (assignee ``visual-proof``) has an
+       ``evidence_url``; no Verify card -> ``"Reviewing"``; latest Verify
+       without ``evidence_url`` -> ``"Blocked"``
     6. every card closed with real work done: PR merged -> ``"Done"``; no PR
        and a card carries ``done_when == "pass"`` -> ``"Done"``; otherwise
        ``None`` (ENG-2378: the issue keeps whatever state it has)
@@ -199,7 +215,7 @@ def issue_status(cards: list[Card], attachments: list[dict] | None = None) -> st
     if closed_with_work(cards):
         gate = pr_gate(links)
         if gate == "open":
-            return "Ready to Merge"
+            return _open_pr_status(cards)
         if gate == "merged" or any(card.done_when == "pass" for card in cards):
             return "Done"
         return None

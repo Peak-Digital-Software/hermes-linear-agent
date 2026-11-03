@@ -104,6 +104,21 @@ async def changed_files(gh: str, full_name: str, number: int) -> list[str]:
     return [line for line in out.splitlines() if line.strip()]
 
 
+async def changed_patches(gh: str, full_name: str, number: int) -> list[tuple[str, str]]:
+    """(path, patch text or "") per file of one PR; GitHub omits ``patch`` for binary/huge files."""
+    out = await _run(
+        gh,
+        [
+            "api",
+            f"repos/{full_name}/pulls/{number}/files",
+            "--paginate",
+            "--jq",
+            '.[] | [.filename, (.patch // "")] | @json',
+        ],
+    )
+    return [(row[0], row[1]) for row in (json.loads(line) for line in out.splitlines() if line.strip())]
+
+
 async def open_prs(gh: str, full_name: str) -> list[OpenPr]:
     """Open, non-draft PRs of one repo."""
     out = await _run(

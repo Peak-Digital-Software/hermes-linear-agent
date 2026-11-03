@@ -31,6 +31,7 @@ class Fakes:
         self.cards: dict[str, dict[str, Card]] = {}  # tenant -> id -> Card
         self.by_key: dict[str, str] = {}
         self.creates: list[tuple] = []
+        self.titles: dict[str, str] = {}
 
     async def repos(self, gh, org):
         return {f"{org}/{name}": flag for name, flag in self.production.items()}
@@ -42,7 +43,16 @@ class Fakes:
         return self.prs_by_repo[name]
 
     async def changed(self, gh, full_name, number):
-        return self.files.get((full_name.split("/")[1], number), ["x.py"])
+        paths = self.files.get((full_name.split("/")[1], number), ["x.py"])
+        return [(p, "") if isinstance(p, str) else p for p in paths]
+
+    async def open_cards(self, board, assignee):
+        return [
+            {"id": cid, "title": self.titles[cid], "status": card.status}
+            for cards in self.cards.values()
+            for cid, card in cards.items()
+            if card.assignee == assignee and card.status != "done"
+        ]
 
     async def list_cards(self, board, key):
         return list(self.cards.get(key, {}).values())
@@ -54,6 +64,7 @@ class Fakes:
         card_id = f"t_{len(self.by_key) + 1}"
         self.by_key[key] = card_id
         self.creates.append((board, title, kw))
+        self.titles[card_id] = title
         self.cards.setdefault(kw["tenant"], {})[card_id] = Card(card_id, "ready", kw["assignee"], None)
         return card_id
 
@@ -70,6 +81,7 @@ class Fakes:
             repos=self.repos,
             prs=self.prs,
             files=self.changed,
+            open_cards=self.open_cards,
         )
 
 
@@ -78,9 +90,11 @@ async def test_ui_pr_on_production_repo_creates_one_card():
     assert await f.run() == ["t_1"]
     ((board, title, kw),) = f.creates
     assert board == "engineering"
-    assert title == "Visual proof: alpha#7 @ abcdef1"
+    assert title == "Verify: alpha#7 @ abcdef1"
     assert kw["idempotency_key"] == "proof/alpha#7@abcdef1234567890"
-    assert kw["tenant"] == "proof:alpha"
+    assert kw["tenant"] == "ENG-100"
+    assert "Mode: ui" in kw["body"]
+    assert "evidence_url" in kw["body"]
     assert kw["assignee"] == "visual-proof"
     assert kw["skills"] == ["visual-proof"]
     assert kw["workspace"] == "scratch"
@@ -111,7 +125,7 @@ async def test_ui_path_detection():
         {"alpha": [_pr(number=1), _pr(number=2), _pr(number=3)]},
         files={("alpha", 1): ["a.py"], ("alpha", 2): ["apps/x.py", "my-app/readme.md"], ("alpha", 3): ["c.py"]},
     )
-    assert await f.run() == []
+    assert len(await f.run()) == 1  # logic-only PRs are carded too (one per pass)
     for number, path in ((4, "src/app/page.ts"), (5, "components/x.ts")):
         g = Fakes({"alpha": [_pr(number=number)]}, files={("alpha", number): [path]})
         assert len(await g.run()) == 1
@@ -129,11 +143,11 @@ async def test_one_proof_per_repo_per_pass_and_next_after_done():
         files={("alpha", 7): ["a.tsx"], ("alpha", 9): ["b.tsx"]},
     )
     assert await f.run() == ["t_1"]
-    assert f.creates[0][1].startswith("Visual proof: alpha#7")
+    assert f.creates[0][1].startswith("Verify: alpha#7")
     assert await f.run() == []  # first card still open: whole repo skipped
     f.finish("t_1")
     assert await f.run() == ["t_2"]
-    assert f.creates[1][1].startswith("Visual proof: alpha#9")
+    assert f.creates[1][1].startswith("Verify: alpha#9")
 
 
 async def test_new_head_sha_gets_a_new_card():
@@ -153,12 +167,13 @@ async def test_failing_repo_does_not_stop_another():
         failing={"alpha"},
     )
     assert await f.run() == ["t_1"]
-    assert f.creates[0][2]["tenant"] == "proof:beta"
+    assert f.creates[0][2]["tenant"] == "ENG-100"
 
 
 async def test_pr_without_issue_key_says_post_on_pr_only():
     f = Fakes({"alpha": [_pr(title="no key here")]}, files={("alpha", 7): ["a.tsx"]})
     await f.run()
+    assert f.creates[0][2]["tenant"] == "proof:alpha"
     assert "none: PR has no issue key, block" in f.creates[0][2]["body"]
 
 
@@ -200,3 +215,57 @@ async def test_changed_files_argv(monkeypatch):
     calls = _install(monkeypatch, "a.tsx\nb/c.py\n")
     assert await github_prs.changed_files("gh", "o/r", 5) == ["a.tsx", "b/c.py"]
     assert calls == [("gh", "api", "repos/o/r/pulls/5/files", "--paginate", "--jq", ".[].filename")]
+
+
+async def test_backend_only_integration_diff_gets_a_verify_card():
+    f = Fakes({"alpha": [_pr()]}, files={("alpha", 7): ["core/services/stripe/void.ts"]})
+    assert await f.run() == ["t_1"]
+    assert "Mode: integration" in f.creates[0][2]["body"]
+
+
+async def test_integration_found_in_patch_lines_only():
+    changed = [("src/a.ts", "@@\n+await shopify.sync()\n")]
+    assert pr_proof.classify(changed) == ["integration"]
+    assert pr_proof.classify([("src/a.ts", "@@\n context stripe\n+x = 1\n")]) == ["logic"]
+
+
+async def test_md_only_diff_is_logic():
+    f = Fakes({"alpha": [_pr()]}, files={("alpha", 7): ["README.md"]})
+    assert await f.run() == ["t_1"]
+    assert "Mode: logic" in f.creates[0][2]["body"]
+
+
+async def test_ui_plus_integration_lists_both_modes():
+    assert pr_proof.classify([("a.tsx", ""), ("lib/stripe.ts", "")]) == ["ui", "integration"]
+    f = Fakes({"alpha": [_pr()]}, files={("alpha", 7): ["a.tsx", "lib/stripe.ts"]})
+    await f.run()
+    assert "Mode: ui, integration" in f.creates[0][2]["body"]
+
+
+async def test_repo_with_open_verify_card_is_skipped():
+    f = Fakes({"alpha": [_pr()]})
+
+    async def busy(board, assignee):
+        assert assignee == "visual-proof"
+        return [{"id": "t_9", "title": "Verify: alpha#3 @ 1234567", "status": "running"}]
+
+    assert (
+        await pr_proof.reconcile_proofs(
+            gh="gh",
+            list_cards=f.list_cards,
+            create=f.create,
+            repos=f.repos,
+            prs=f.prs,
+            files=f.changed,
+            open_cards=busy,
+        )
+        == []
+    )
+    assert f.creates == []
+
+
+async def test_changed_patches_argv_and_parse(monkeypatch):
+    rows = '["a.tsx","@@ -1 +1 @@\\n+x"]\n["img.png",""]\n'
+    calls = _install(monkeypatch, rows)
+    assert await github_prs.changed_patches("gh", "o/r", 5) == [("a.tsx", "@@ -1 +1 @@\n+x"), ("img.png", "")]
+    assert calls[0][:5] == ("gh", "api", "repos/o/r/pulls/5/files", "--paginate", "--jq")

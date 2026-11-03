@@ -16,6 +16,7 @@ import pytest
 from hermes_linear_agent.kanban_rules import (
     ACTED,
     CLOSED_TYPES,
+    VERIFY_ASSIGNEE,
     Card,
     hand_set,
     is_completed,
@@ -34,8 +35,30 @@ def card(
     assignee: str | None = None,
     completed_at: int | None = None,
     done_when: str | None = None,
+    evidence_url: str | None = None,
 ) -> Card:
-    return Card(id=card_id, status=status, assignee=assignee, completed_at=completed_at, done_when=done_when)
+    return Card(
+        id=card_id,
+        status=status,
+        assignee=assignee,
+        completed_at=completed_at,
+        done_when=done_when,
+        evidence_url=evidence_url,
+    )
+
+
+EVIDENCE = "https://linear.app/x/issue/ENG-1#comment-1"
+
+
+def verify(
+    card_id: str,
+    status: str = "done",
+    completed_at: int | None = 2,
+    evidence_url: str | None = EVIDENCE,
+    done_when_pass: bool = False,
+) -> Card:
+    done_when = "pass" if done_when_pass else None
+    return card(card_id, status, VERIFY_ASSIGNEE, completed_at, done_when, evidence_url)
 
 
 def pr_link(number: int, status: str | None = None) -> dict:
@@ -288,11 +311,51 @@ def test_rollup_reads_ops_started_names_as_working():
             "Todo",
             id="row4-done-plus-todo-and-ready-is-todo",
         ),
-        # row 5: every card completed, PR still open
+        # row 5: every card completed, PR still open: gated on the latest Verify card's evidence_url
         pytest.param(
-            [card("t_a", "done", completed_at=1), card("t_b", "done", completed_at=2)],
+            [card("t_a", "done", completed_at=1), verify("t_b")],
             "Ready to Merge",
             id="row5-done-set-with-open-pr",
+        ),
+        pytest.param(
+            [card("t_a", "done", completed_at=1), card("t_b", "done", completed_at=2)],
+            "Reviewing",
+            id="row5-open-pr-no-verify-card-is-reviewing",
+        ),
+        pytest.param(
+            [card("t_a", "done", completed_at=1), verify("t_b", evidence_url=None)],
+            "Blocked",
+            id="row5-open-pr-verify-without-evidence-is-blocked",
+        ),
+        pytest.param(
+            [card("t_a", "done", completed_at=1), verify("t_b", evidence_url="")],
+            "Blocked",
+            id="row5-open-pr-verify-empty-evidence-is-blocked",
+        ),
+        pytest.param(
+            [verify("t_a", completed_at=1, evidence_url=None), verify("t_b", completed_at=5)],
+            "Ready to Merge",
+            id="row5-latest-verify-wins-when-it-has-evidence",
+        ),
+        pytest.param(
+            [verify("t_a", completed_at=1), verify("t_b", completed_at=5, evidence_url=None)],
+            "Blocked",
+            id="row5-latest-verify-wins-when-it-lacks-evidence",
+        ),
+        pytest.param(
+            [card("t_a", "done", completed_at=1), verify("t_b", "blocked", None, None)],
+            "Blocked",
+            id="row5-blocked-verify-card-is-blocked",
+        ),
+        pytest.param(
+            [card("t_a", "done", completed_at=1), verify("t_b", "running", None, None)],
+            "Working",
+            id="row5-running-verify-card-is-not-ready-to-merge",
+        ),
+        pytest.param(
+            [card("t_a", "done", completed_at=1), verify("t_b", "ready", None, None)],
+            "Todo",
+            id="row5-ready-verify-card-is-not-ready-to-merge",
         ),
         # row 6: every card completed, PR merged or none
         pytest.param(
@@ -324,8 +387,8 @@ def test_rollup_reads_ops_started_names_as_working():
         pytest.param([card("t_a", "archived"), card("t_b", "running")], "Working", id="archived-beside-running"),
     ],
 )
-def test_issue_status_follows_the_eight_row_precedence(cards, expected):
-    attachments = [pr_link(156, "open")] if expected == "Ready to Merge" else None
+def test_issue_status_follows_the_eight_row_precedence(request, cards, expected):
+    attachments = [pr_link(156, "open")] if request.node.callspec.id.startswith("row5") else None
     assert issue_status(cards, attachments) == expected
 
 
@@ -345,7 +408,7 @@ def test_issue_status_follows_the_eight_row_precedence(cards, expected):
     ],
 )
 def test_a_completed_card_set_is_ready_to_merge_only_when_no_pr_is_merged(links, expected):
-    done_set = [card("t_a", "done", completed_at=1), card("t_b", "done", completed_at=2, done_when="pass")]
+    done_set = [card("t_a", "done", completed_at=1), verify("t_b", done_when_pass=True)]
     if links == [pr_link(1, "merged")]:
         done_set = [card("t_a", "done", completed_at=1), card("t_b", "archived")]
     assert issue_status(done_set, links) == expected
@@ -364,7 +427,7 @@ def test_done_when_evidence_on_any_one_card_is_enough_without_a_pr():
 
 
 def test_evidence_never_beats_an_open_pr():
-    done_set = [card("t_a", "done", completed_at=1, done_when="pass")]
+    done_set = [card("t_a", "done", completed_at=1, done_when="pass"), verify("t_v")]
     assert issue_status(done_set, [pr_link(156, "open")]) == "Ready to Merge"
 
 
