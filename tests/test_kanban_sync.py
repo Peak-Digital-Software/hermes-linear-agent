@@ -460,6 +460,26 @@ async def test_done_by_hand_archives_and_a_duplicate_closes_like_canceled(boards
     assert duplicate == "route ENG-3: cancel: archived 1"
 
 
+async def test_a_close_keeps_a_running_card_and_archives_the_rest(boards):
+    sync = KanbanSync(FakeClient())
+    boards.cards_by[(BOARD, "ENG-1")] = [card("t_run", "running"), card("t_ready", "ready")]
+
+    line = await sync.handle_issue_webhook(issue_payload("ENG-1", was_state="s-working", now_state="s-done"))
+
+    assert line == "route ENG-1: close: archived 1"
+    assert boards.archive_calls == [(BOARD, ["t_ready"])]
+
+
+async def test_a_cancel_still_archives_a_running_card(boards):
+    sync = KanbanSync(FakeClient())
+    boards.cards_by[(BOARD, "ENG-1")] = [card("t_run", "running"), card("t_ready", "ready")]
+
+    line = await sync.handle_issue_webhook(issue_payload("ENG-1", was_state="s-working", now_state="s-canceled"))
+
+    assert line == "route ENG-1: cancel: archived 2"
+    assert boards.archive_calls == [(BOARD, ["t_run", "t_ready"])]
+
+
 async def test_an_echo_with_no_open_cards_makes_no_archive_call(boards):
     sync = KanbanSync(FakeClient())
     boards.cards_by[(BOARD, "ENG-1")] = [card("t_done", "done"), card("t_gone", "archived")]
