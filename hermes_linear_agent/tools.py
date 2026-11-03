@@ -37,7 +37,10 @@ DEFAULT_AUTH_BODY = "Please authenticate to continue"
 def _merge_tool_args(args, kwargs):
     """Accept the tool call as a positional dict (registry) or kwargs."""
     if args and isinstance(args[0], dict):
-        kwargs.update(args[0])
+        # Registry path: kwargs are dispatcher context (Hermes' own task_id,
+        # session_id, user_task), not model args. Merging them let the agent
+        # task id win the issue_id/task_id/id alias lookup (ENG-2324).
+        return dict(args[0])
     return kwargs
 
 
