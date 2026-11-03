@@ -17,6 +17,7 @@ import hashlib
 import hmac
 import json
 import time
+from pathlib import Path
 
 import pytest
 from test_linear_agent_adapter import (
@@ -28,6 +29,7 @@ from test_linear_agent_adapter import (
 
 from hermes_linear_agent.client import LinearApiError, LinearGraphQLClient
 from hermes_linear_agent.webhook import (
+    comment_mention,
     is_stale_body_timestamp,
     unblocked_issue,
     verify_linear_signature,
@@ -302,3 +304,41 @@ def test_unblocked_issue_falls_back_to_the_nested_issue_id():
 )
 def test_unblocked_issue_ignores_any_other_shape(payload):
     assert unblocked_issue(payload) is None
+
+
+# ---------------------------------------------------------------------------
+# issueCommentMention classifier
+# ---------------------------------------------------------------------------
+
+
+def _mention_fixture() -> dict:
+    path = Path(__file__).parent / "fixtures" / "issue_comment_mention.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_comment_mention_parses_real_delivery():
+    mention = comment_mention(_mention_fixture())
+    assert mention is not None
+    assert mention.notification_id == "3d0e34c0-e7a5-4fda-b98b-4c1d0f821a70"
+    assert mention.issue_id == "ad6a52db-5cd3-46d3-a8b6-ff31649ea1b0"
+    assert mention.issue_key == "ENG-2324"
+    assert mention.actor_name == "Baxter"
+    assert mention.actor_id == "9c7f2bb0-74a5-47d3-bbeb-ad5caa0fb037"
+    assert mention.comment_id == "1edd87b1-b1f6-410d-b917-70d4b6c1d0d6"
+    assert mention.body.startswith("@Gilfoyle")
+
+
+def test_comment_mention_action_is_case_insensitive():
+    payload = _mention_fixture()
+    payload["action"] = "ISSUECOMMENTMENTION"
+    assert comment_mention(payload) is not None
+
+
+def test_comment_mention_ignores_other_shapes():
+    unblocked = {"type": "AppUserNotification", "action": "issueUnblocked", "notification": {"issueId": "i"}}
+    session = {"type": "AgentSessionEvent", "action": "created", "agentSession": {"id": "s"}}
+    no_body = _mention_fixture()
+    del no_body["notification"]["comment"]["body"]
+    assert comment_mention(unblocked) is None
+    assert comment_mention(session) is None
+    assert comment_mention(no_body) is None

@@ -1,0 +1,45 @@
+{
+  "type": "AppUserNotification",
+  "action": "issueCommentMention",
+  "createdAt": "2026-11-03T05:17:18.582Z",
+  "organizationId": "73dc716b-216c-4127-b078-0235cb85978f",
+  "oauthClientId": "0814834a50b5f02fb7e181ad1acfbc8d",
+  "appUserId": "21d33d4d-d1f5-4348-9dfb-29e46df5156a",
+  "notification": {
+    "id": "3d0e34c0-e7a5-4fda-b98b-4c1d0f821a70",
+    "createdAt": "2026-11-03T05:17:18.396Z",
+    "updatedAt": "2026-11-03T05:17:18.396Z",
+    "archivedAt": null,
+    "type": "issueCommentMention",
+    "actorId": "9c7f2bb0-74a5-47d3-bbeb-ad5caa0fb037",
+    "externalUserActorId": null,
+    "userId": "21d33d4d-d1f5-4348-9dfb-29e46df5156a",
+    "issueId": "ad6a52db-5cd3-46d3-a8b6-ff31649ea1b0",
+    "issue": {
+      "id": "ad6a52db-5cd3-46d3-a8b6-ff31649ea1b0",
+      "title": "Linear update tool fails with Entity not found on every call",
+      "teamId": "83fc98a4-ee84-41fe-8ef2-9dc6c714ea83",
+      "team": {
+        "id": "83fc98a4-ee84-41fe-8ef2-9dc6c714ea83",
+        "key": "ENG",
+        "name": "Engineering"
+      },
+      "identifier": "ENG-2324",
+      "url": "https://linear.app/peak-software-development/issue/ENG-2324/linear-update-tool-fails-with-entity-not-found-on-every-call"
+    },
+    "commentId": "1edd87b1-b1f6-410d-b917-70d4b6c1d0d6",
+    "comment": {
+      "id": "1edd87b1-b1f6-410d-b917-70d4b6c1d0d6",
+      "body": "@Gilfoyle the Ship card `t_af55686d` (engineering board) gave up after 2 spawns at 00:03 and never ran: `workspace_kind=worktree` but no `workspace_path`, and the `engineering` board has no `default_workdir`. It needs re-carding with `--workspace worktree:<abs path to hermes-linear-agent>`, or a board default workdir set. Until then [PR #19](<https://github.com/Peak-Digital-Software/hermes-linear-agent/pull/19>) is still unmerged.",
+      "userId": "9c7f2bb0-74a5-47d3-bbeb-ad5caa0fb037",
+      "issueId": "ad6a52db-5cd3-46d3-a8b6-ff31649ea1b0"
+    },
+    "actor": {
+      "id": "9c7f2bb0-74a5-47d3-bbeb-ad5caa0fb037",
+      "name": "Baxter",
+      "url": "https://linear.app/peak-software-development/profiles/baxter"
+    }
+  },
+  "webhookTimestamp": 1793683038668,
+  "webhookId": "b327f612-e173-4f15-ba5e-d61f4fc1bd67"
+}
