@@ -162,6 +162,20 @@ DEFAULT_MUTATION_POLICY = {
 _DEDUP_TTL_SECONDS = 3600
 MAX_MESSAGE_LENGTH = 40_000
 
+APPROVAL_REPLY_LINE = "Reply `approve`, `always` or `deny`."
+# First word of a free-text reply -> choice for tools.approval.resolve_gateway_approval.
+_APPROVAL_REPLY_CHOICES = {
+    "approve": "once",
+    "approved": "once",
+    "once": "once",
+    "session": "session",
+    "always": "always",
+    "deny": "deny",
+    "denied": "deny",
+    "reject": "deny",
+}
+_APPROVAL_FIRST_WORD_RE = re.compile(r"[\W_]*([^\W_]+)")
+
 
 def _str_env(name: str) -> str:
     """Profile-scoped env read: under gateway.multiplex_profiles a profile's .env
@@ -1199,6 +1213,32 @@ class LinearAgentAdapter(BasePlatformAdapter):
             message_id=str(activity.get("id") or ""),
             raw_response=activity,
         )
+
+    async def _send_exec_approval_prompt(self, prompt: Any) -> SendResult:
+        """Post an exec approval as a Linear ``elicitation`` activity.
+
+        Without this override core posts the approval through ``send()`` as a
+        ``response`` activity, which Linear renders as the session's final
+        answer. An elicitation puts the session in ``awaitingInput``. Linear has
+        no buttons here, so the reply is free text (see
+        ``_try_resolve_approval_reply``). Defining it also makes
+        ``supports_exec_approval_buttons()`` True. Failure returns
+        ``SendResult(success=False)`` and core falls back to plain text.
+        """
+        agent_session_id, _issue_id = await self._resolve_reply_session(prompt.chat_id, prompt.metadata)
+        if not agent_session_id:
+            return SendResult(success=False, error="Missing Linear Agent Session ID")
+        body = f"{prompt.text}\n\n{APPROVAL_REPLY_LINE}"
+        if len(body) > self.MAX_MESSAGE_LENGTH:
+            # Keep the reply instruction; trim the command text instead.
+            keep = self.MAX_MESSAGE_LENGTH - len(APPROVAL_REPLY_LINE) - 3
+            body = f"{prompt.text[: max(keep, 0)]}…\n\n{APPROVAL_REPLY_LINE}"[: self.MAX_MESSAGE_LENGTH]
+        try:
+            activity = await self._client.create_response(agent_session_id, body, response_type="elicitation")
+        except Exception as exc:  # noqa: BLE001 - adapter boundary returns SendResult
+            logger.warning("[linear_agent] Failed to create approval elicitation: %s", exc)
+            return SendResult(success=False, error=str(exc))
+        return SendResult(success=True, message_id=str(activity.get("id") or "") or None, raw_response=activity)
 
     async def send_clarify(
         self,
@@ -2307,6 +2347,44 @@ class LinearAgentAdapter(BasePlatformAdapter):
             "agent_session_id": session_id,
         }, 200
 
+    async def _try_resolve_approval_reply(
+        self, context: LinearWebhookContext, message: str, *, profile: str | None = None
+    ) -> bool:
+        """Resolve a pending exec approval from a free-text reply.
+
+        Core resolves an approval only when the whole message equals an approval
+        word, so "Approve cutover" would queue as ordinary input while the turn
+        stays blocked. When this turn's session has a blocking approval and the
+        reply's first word is an approval word, resolve it here and report True
+        so the message is not dispatched. Anything else returns False.
+        """
+        match = _APPROVAL_FIRST_WORD_RE.match(str(message or "").strip().lower())
+        choice = _APPROVAL_REPLY_CHOICES.get(match.group(1)) if match else None
+        if choice is None:
+            return False
+        try:
+            # Core module, present at runtime only.
+            from tools.approval import has_blocking_approval, resolve_gateway_approval
+
+            session_key = self._session_key_for(context, profile=profile)
+            if not has_blocking_approval(session_key):
+                return False
+            resolved = resolve_gateway_approval(session_key, choice)
+        except Exception:  # noqa: BLE001 - never lose the user's message to a resolver fault
+            logger.warning("[linear_agent] Approval reply resolution failed", exc_info=True)
+            return False
+        if not resolved:
+            return False
+        logger.info("[linear_agent] Resolved exec approval from reply: %s", choice)
+        if context.agent_session_id:
+            try:
+                await self._client.create_thought(
+                    context.agent_session_id, "Denied" if choice == "deny" else f"Approved: {choice}"
+                )
+            except Exception as exc:  # noqa: BLE001 - the approval is already resolved
+                logger.warning("[linear_agent] Failed to post approval confirmation: %s", exc)
+        return True
+
     async def _dispatch_linear_message(
         self,
         context: LinearWebhookContext,
@@ -2315,6 +2393,8 @@ class LinearAgentAdapter(BasePlatformAdapter):
         *,
         profile: str | None = None,
     ) -> None:
+        if context.action == "prompted" and await self._try_resolve_approval_reply(context, message, profile=profile):
+            return
         source = self._build_source(context, profile=profile)
         event = MessageEvent(
             text=message,
