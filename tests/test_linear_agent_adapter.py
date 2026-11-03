@@ -52,11 +52,18 @@ class _FakeLinearClient:
     def __init__(self):
         self.calls = []
         self.thought_ephemeral_flags = []
+        self.issue = {"id": "issue-1", "state": {"name": "Working", "type": "started"}, "delegate": {"id": "bot"}}
 
     async def create_thought(self, agent_session_id, body, *, ephemeral=False):
         self.calls.append(("thought", agent_session_id, body))
         self.thought_ephemeral_flags.append(ephemeral)
         return {"id": "thought-1"}
+
+    async def get_issue(self, id):
+        self.calls.append(("get_issue", id))
+        if isinstance(self.issue, Exception):
+            raise self.issue
+        return self.issue
 
     async def create_response(
         self,
@@ -1862,6 +1869,100 @@ async def test_send_posts_kanban_pings_as_thoughts_so_the_session_stays_active()
     assert fake_client.calls[-1][0] == "response"
     await adapter.send("issue-1", "Reviewed Kanban t_06b81f17, it is fine.", metadata={})
     assert fake_client.calls[-1][0] == "response"
+
+
+_GO_TEXT = "Plan written.\n\nReply go and I will start."
+
+
+def _gate_hits(tmp_path):
+    import json as _json
+
+    path = tmp_path / "gate-hits.jsonl"
+    if not path.exists():
+        return []
+    return [_json.loads(line) for line in path.read_text().splitlines()]
+
+
+@pytest.mark.asyncio
+async def test_go_gated_reply_on_working_issue_posts_a_thought_and_logs(tmp_path, monkeypatch):
+    monkeypatch.setenv("PEAK_AGENT_STATE_DIR", str(tmp_path))
+    fake_client = _FakeLinearClient()
+    adapter = _make_adapter(client=fake_client)
+    adapter._latest_agent_session["issue-1"] = "session-1"
+
+    result = await adapter.send("issue-1", _GO_TEXT, metadata={})
+
+    assert result.success is True
+    assert [c[0] for c in fake_client.calls] == ["get_issue", "thought"]
+    assert fake_client.calls[1] == ("thought", "session-1", _GO_TEXT)
+    assert fake_client.thought_ephemeral_flags == [False]
+    hits = _gate_hits(tmp_path)
+    assert len(hits) == 1
+    assert hits[0]["issue"] == "issue-1"
+    assert hits[0]["session"] == "session-1"
+    assert hits[0]["pattern"] == r"\breply\s+[\"'`]?go\b"
+    assert hits[0]["posted_as"] == "thought"
+    assert hits[0]["scope"] == "gated"
+    assert hits[0]["ts"].endswith("+00:00")
+    assert "profile" in hits[0]
+
+
+@pytest.mark.asyncio
+async def test_go_gated_reply_on_ready_to_merge_posts_a_response(tmp_path, monkeypatch):
+    monkeypatch.setenv("PEAK_AGENT_STATE_DIR", str(tmp_path))
+    fake_client = _FakeLinearClient()
+    fake_client.issue = {"state": {"name": "Ready to Merge", "type": "started"}, "delegate": {"id": "bot"}}
+    adapter = _make_adapter(client=fake_client)
+    adapter._latest_agent_session["issue-1"] = "session-1"
+
+    await adapter.send("issue-1", _GO_TEXT, metadata={})
+
+    assert fake_client.calls[-1][0] == "response"
+    assert [h["posted_as"] for h in _gate_hits(tmp_path)] == ["response"]
+    assert _gate_hits(tmp_path)[0]["scope"] == "exempt"
+
+
+@pytest.mark.asyncio
+async def test_go_gated_reply_on_undelegated_triage_posts_a_response(tmp_path, monkeypatch):
+    monkeypatch.setenv("PEAK_AGENT_STATE_DIR", str(tmp_path))
+    fake_client = _FakeLinearClient()
+    fake_client.issue = {"state": {"name": "Triage", "type": "triage"}, "delegate": None}
+    adapter = _make_adapter(client=fake_client)
+    adapter._latest_agent_session["issue-1"] = "session-1"
+
+    await adapter.send("issue-1", _GO_TEXT, metadata={})
+
+    assert fake_client.calls[-1][0] == "response"
+    assert _gate_hits(tmp_path)[0]["scope"] == "exempt"
+
+
+@pytest.mark.asyncio
+async def test_go_gate_fails_open_when_get_issue_raises(tmp_path, monkeypatch):
+    monkeypatch.setenv("PEAK_AGENT_STATE_DIR", str(tmp_path))
+    fake_client = _FakeLinearClient()
+    fake_client.issue = RuntimeError("linear down")
+    adapter = _make_adapter(client=fake_client)
+    adapter._latest_agent_session["issue-1"] = "session-1"
+
+    result = await adapter.send("issue-1", _GO_TEXT, metadata={})
+
+    assert result.success is True
+    assert fake_client.calls[-1][0] == "response"
+    hits = _gate_hits(tmp_path)
+    assert [(h["scope"], h["posted_as"]) for h in hits] == [("unknown", "response")]
+
+
+@pytest.mark.asyncio
+async def test_non_gated_reply_makes_no_get_issue_call(tmp_path, monkeypatch):
+    monkeypatch.setenv("PEAK_AGENT_STATE_DIR", str(tmp_path))
+    fake_client = _FakeLinearClient()
+    adapter = _make_adapter(client=fake_client)
+    adapter._latest_agent_session["issue-1"] = "session-1"
+
+    await adapter.send("issue-1", "All done.\n\nPR is merged.", metadata={})
+
+    assert [c[0] for c in fake_client.calls] == ["response"]
+    assert _gate_hits(tmp_path) == []
 
 
 @pytest.mark.asyncio
