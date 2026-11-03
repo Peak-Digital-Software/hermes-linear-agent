@@ -43,7 +43,7 @@ try:
 except Exception as e:
     logging.getLogger(__name__).warning(f"[linear_agent] Failed to register tools: {e}")
 
-from . import go_gate
+from . import go_gate, merge_gate
 from .client import DEFAULT_LINEAR_GRAPHQL_URL, LinearGraphQLClient
 from .gateway_state import gateway_draining, gateway_ready
 from .mention_cap import MentionCap
@@ -1238,14 +1238,35 @@ class LinearAgentAdapter(BasePlatformAdapter):
                 return SendResult(success=False, error=str(exc))
             return SendResult(success=True, message_id=str(activity.get("id") or "") or None)
         gate_pattern = go_gate.match(content)
-        if gate_pattern:
-            # Only a hit costs a query. Fail open: an unreadable issue posts
-            # the normal response but is still logged.
+        merge_pattern = merge_gate.match(content)
+        gate_issue: dict[str, Any] | None = None
+        gate_lookup_ok = False
+        if gate_pattern or merge_pattern:
+            # Only a hit costs a query, shared by both gates. Fail open: an
+            # unreadable issue posts the normal response but is still logged.
             try:
-                scope = go_gate.scope_for(await self._client.get_issue(issue_id or chat_id))
+                gate_issue = await self._client.get_issue(issue_id or chat_id)
+                gate_lookup_ok = True
             except Exception as exc:  # noqa: BLE001 - fail open
-                logger.warning("[linear_agent] go-gate scope lookup failed for %s: %s", chat_id, exc)
-                scope = "unknown"
+                logger.warning("[linear_agent] gate issue lookup failed for %s: %s", chat_id, exc)
+        if merge_pattern and gate_lookup_ok and not merge_gate.allowed(gate_issue):
+            merge_state = ((gate_issue or {}).get("state") or {}).get("name") if isinstance(gate_issue, dict) else None
+            merge_gate.log_hit(
+                issue=issue_id or chat_id,
+                session=agent_session_id,
+                profile=self._own_profile_name() or None,
+                pattern=merge_pattern,
+                posted_as="thought",
+                state=merge_state,
+            )
+            try:
+                activity = await self._client.create_thought(agent_session_id, content)
+            except Exception as exc:  # noqa: BLE001 - adapter boundary returns SendResult
+                logger.warning("[linear_agent] Failed to create merge-gate thought activity: %s", exc)
+                return SendResult(success=False, error=str(exc))
+            return SendResult(success=True, message_id=str(activity.get("id") or "") or None)
+        if gate_pattern:
+            scope = go_gate.scope_for(gate_issue) if gate_lookup_ok else "unknown"
             gated = scope == "gated"
             go_gate.log_hit(
                 issue=issue_id or chat_id,
