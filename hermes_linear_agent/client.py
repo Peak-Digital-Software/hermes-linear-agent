@@ -1154,6 +1154,35 @@ mutation AgentSessionUpdate($id: String!, $input: AgentSessionUpdateInput!) {
         issue = data.get("issue") or {}
         return str((issue.get("creator") or {}).get("id") or "").strip()
 
+    async def get_issue_delegator_user_id(self, issue_id: str, delegate_id: str) -> str:
+        """Actor who last delegated an issue to ``delegate_id`` (\"\" when unavailable).
+
+        An issue filed by this app with no assignee names no human anywhere in
+        the session payload; the issue history records who set the delegate,
+        which is the only evidence of who the work is for. The newest history
+        node (by ``createdAt``) whose ``toDelegate`` is ``delegate_id`` wins.
+        """
+        q = """
+        query IssueDelegator($id: String!) {
+          issue(id: $id) {
+            history(first: 50) {
+              nodes { createdAt actor { id } toDelegate { id } }
+            }
+          }
+        }
+        """
+        data = await self.execute(q, {"id": issue_id})
+        nodes = (((data.get("issue") or {}).get("history") or {}).get("nodes")) or []
+        matches = [
+            node
+            for node in nodes
+            if isinstance(node, dict) and str((node.get("toDelegate") or {}).get("id") or "").strip() == delegate_id
+        ]
+        if not matches:
+            return ""
+        newest = max(matches, key=lambda node: str(node.get("createdAt") or ""))
+        return str((newest.get("actor") or {}).get("id") or "").strip()
+
     async def get_comment_thread_root_id(self, comment_id: str) -> str | None:
         """Return the root comment ID for a root or child comment.
 
