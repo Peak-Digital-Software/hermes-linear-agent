@@ -112,6 +112,36 @@ async def test_show_treats_completed_at_as_done(fake_exec):
     assert await kanban_cli.show("b", "t_a") == {"id": "t_a", "tenant": "ENG-1", "completed": True}
 
 
+async def test_done_when_reads_the_latest_run_metadata(fake_exec):
+    fake = fake_exec((FIXTURES / "show-runs.json").read_text())
+
+    assert await kanban_cli.done_when("hermes-linear-agent", "t_ship") == "pass"
+    assert fake.calls == [["kanban", "--board", "hermes-linear-agent", "show", "t_ship", "--json"]]
+
+
+async def test_done_when_is_none_without_the_key_or_runs(fake_exec):
+    fake_exec(json.dumps({"task": {"id": "t_a"}, "runs": [{"id": 1, "ended_at": 5, "metadata": {"branch": "x"}}]}))
+    assert await kanban_cli.done_when("b", "t_a") is None
+
+    fake_exec(json.dumps({"task": {"id": "t_a"}, "runs": []}))
+    assert await kanban_cli.done_when("b", "t_a") is None
+
+
+async def test_done_when_is_none_on_bad_json(fake_exec):
+    fake_exec("not json {")
+
+    assert await kanban_cli.done_when("b", "t_a") is None
+
+
+async def test_done_when_is_none_when_the_cli_fails(monkeypatch):
+    async def boom(*args, **kwargs):
+        raise OSError("no hermes")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", boom)
+
+    assert await kanban_cli.done_when("b", "t_a") is None
+
+
 async def test_archive_makes_one_call_for_every_card(fake_exec):
     fake = fake_exec("")
 

@@ -1,0 +1,49 @@
+{
+  "task": {
+    "id": "t_ship",
+    "title": "Ship card",
+    "assignee": "coder",
+    "status": "done",
+    "tenant": "ENG-0000",
+    "completed_at": 1793689026
+  },
+  "latest_summary": "Verified.",
+  "events": [
+    {
+      "kind": "completed",
+      "payload": {
+        "summary": "Verified."
+      },
+      "created_at": 1793689026,
+      "run_id": 2
+    }
+  ],
+  "runs": [
+    {
+      "id": 1,
+      "profile": "coder",
+      "status": "done",
+      "outcome": "blocked",
+      "summary": "first",
+      "metadata": {
+        "done_when": "fail"
+      },
+      "started_at": 1793688000,
+      "ended_at": 1793688500
+    },
+    {
+      "id": 2,
+      "profile": "coder",
+      "status": "done",
+      "outcome": "completed",
+      "summary": "Verified.",
+      "metadata": {
+        "branch": "ship/t_ship",
+        "done_when": "pass",
+        "done_when_evidence": "pytest 735 passed"
+      },
+      "started_at": 1793688978,
+      "ended_at": 1793689026
+    }
+  ]
+}

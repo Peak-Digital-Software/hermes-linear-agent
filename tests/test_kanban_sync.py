@@ -105,7 +105,10 @@ class FakeClient:
         parents: dict[str, dict[str, str]] | None = None,
         children: dict[str, list[dict[str, Any]]] | None = None,
         ops_pages: dict[str | None, dict[str, Any]] | None = None,
+        updated_at: dict[str, str] | None = None,
     ) -> None:
+        # issue key -> updatedAt, for the hand-set guard (ENG-2378)
+        self.updated_at = updated_at or {}
         self.current = {key: state(name, team_of(key)["key"]) for key, name in (current or {}).items()}
         # ActiveIssues pages for the OPS team; `active_pages` answers ENG
         self.ops_pages = ops_pages or {}
@@ -165,6 +168,7 @@ class FakeClient:
                 "issue": {
                     "id": issue_id,
                     "identifier": identifier,
+                    "updatedAt": self.updated_at.get(identifier),
                     "state": node,
                     "team": team,
                     "parent": self.parents.get(identifier) or self.parents.get(issue_id),
@@ -216,6 +220,7 @@ class Boards:
         self.archived: set[str] = set()
         self.paths: dict[str, str] = {}
         self.cards_by: dict[tuple[str, str], list[Card]] = {}
+        self.done_whens: dict[str, str | None] = {}
         self.shows: dict[str, dict[str, Any]] = {}
         self.events: dict[str, list[dict[str, Any]]] = {}
         self.cursors: dict[str, int] = {}
@@ -238,6 +243,9 @@ class Boards:
 
     async def show(self, board: str, task_id: str) -> dict[str, Any]:
         return dict(self.shows.get(task_id, {"id": task_id, "tenant": None, "completed": False}))
+
+    async def done_when(self, board: str, task_id: str) -> str | None:
+        return self.done_whens.get(task_id)
 
     async def archive(self, board: str, ids: list[str]) -> None:
         self.archive_calls.append((board, list(ids)))
@@ -278,6 +286,7 @@ def cli(monkeypatch) -> Boards:
     monkeypatch.setattr(kanban_cli, "boards", fake.boards)
     monkeypatch.setattr(kanban_cli, "cards", fake.cards)
     monkeypatch.setattr(kanban_cli, "show", fake.show)
+    monkeypatch.setattr(kanban_cli, "done_when", fake.done_when)
     monkeypatch.setattr(kanban_cli, "archive", fake.archive)
     return fake
 
@@ -794,6 +803,7 @@ async def test_a_parent_whose_children_are_all_done_is_left_alone(boards):
     client.children["issue-ENG-1"] = [child_node("ENG-2", "Done"), child_node("ENG-3", "Todo")]
     client.parents["ENG-3"] = {"id": "issue-ENG-1", "identifier": "ENG-1"}
     sync = KanbanSync(client)
+    boards.done_whens["t_3"] = "pass"
     boards.shows["t_3"] = {"id": "t_3", "tenant": "ENG-3", "completed": True}
     boards.cards_by[(BOARD, "ENG-3")] = [card("t_3", "done", "coder", 1)]
 
@@ -1275,9 +1285,98 @@ async def test_reconcile_writes_done_with_no_pr(boards):
     client = FakeClient(active_pages={None: page([active_issue("ENG-20", "Working", [REPO_LINK])])})
     sync = KanbanSync(client)
     boards.cards_by[(BOARD, "ENG-20")] = [card("t_a", "done", "coder", 1), card("t_b", "done", "reviewer", 2)]
+    boards.done_whens["t_b"] = "pass"
 
     assert await sync.reconcile() == 1
     assert client.updates == [{"id": "issue-ENG-20", "stateId": "s-done"}]
+
+
+async def test_reconcile_writes_nothing_when_all_done_without_a_pr_or_evidence(boards):
+    client = FakeClient(active_pages={None: page([active_issue("ENG-20", "Working", [REPO_LINK])])})
+    sync = KanbanSync(client)
+    boards.cards_by[(BOARD, "ENG-20")] = [card("t_a", "done", "coder", 1), card("t_b", "done", "reviewer", 2)]
+    boards.done_whens["t_a"] = "fail"
+
+    assert await sync.reconcile() == 0
+    assert client.updates == []
+
+
+async def test_an_event_with_all_done_and_no_evidence_writes_nothing(boards):
+    client = FakeClient(current={"ENG-3": "Working"}, attachments={"issue-ENG-3": [REPO_LINK]})
+    boards.shows["t_3"] = {"id": "t_3", "tenant": "ENG-3", "completed": True}
+    boards.cards_by[(BOARD, "ENG-3")] = [card("t_3", "done", "coder", 1)]
+
+    await KanbanSync(client)._handle_event(BOARD, event(1, "t_3", "completed"))
+
+    assert client.updates == []
+    assert not client.operations("IssueUpdate")
+
+
+async def test_an_event_with_all_done_and_evidence_writes_done(boards):
+    client = FakeClient(current={"ENG-3": "Working"}, attachments={"issue-ENG-3": []})
+    boards.shows["t_3"] = {"id": "t_3", "tenant": "ENG-3", "completed": True}
+    boards.cards_by[(BOARD, "ENG-3")] = [card("t_3", "done", "coder", 1)]
+    boards.done_whens["t_3"] = "pass"
+
+    await KanbanSync(client)._handle_event(BOARD, event(1, "t_3", "completed"))
+
+    assert client.updates == [{"id": "issue-ENG-3", "stateId": "s-done"}]
+
+
+def _iso_ago(seconds: float) -> str:
+    import datetime as dt
+
+    return (dt.datetime.now(dt.UTC) - dt.timedelta(seconds=seconds)).isoformat().replace("+00:00", "Z")
+
+
+async def test_a_card_state_write_skips_an_issue_hand_set_five_minutes_ago(boards):
+    client = FakeClient(current={"ENG-3": "Todo"}, updated_at={"ENG-3": _iso_ago(300)})
+    boards.shows["t_3"] = {"id": "t_3", "tenant": "ENG-3", "completed": False}
+    boards.cards_by[(BOARD, "ENG-3")] = [card("t_3", "running", "coder")]
+
+    await KanbanSync(client)._handle_event(BOARD, event(1, "t_3", "claimed"))
+
+    assert client.updates == []
+
+
+async def test_a_merged_pr_done_writes_even_when_hand_set_five_minutes_ago(boards):
+    client = FakeClient(
+        current={"ENG-3": "Ready to Merge"},
+        attachments={"issue-ENG-3": [pr_link(7, "merged")]},
+        updated_at={"ENG-3": _iso_ago(300)},
+    )
+    boards.shows["t_3"] = {"id": "t_3", "tenant": "ENG-3", "completed": True}
+    boards.cards_by[(BOARD, "ENG-3")] = [card("t_3", "done", "coder", 1)]
+
+    await KanbanSync(client)._handle_event(BOARD, event(1, "t_3", "completed"))
+
+    assert client.updates == [{"id": "issue-ENG-3", "stateId": "s-done"}]
+
+
+async def test_an_edit_older_than_thirty_minutes_does_not_block_the_sync(boards):
+    client = FakeClient(current={"ENG-3": "Todo"}, updated_at={"ENG-3": _iso_ago(31 * 60)})
+    boards.shows["t_3"] = {"id": "t_3", "tenant": "ENG-3", "completed": False}
+    boards.cards_by[(BOARD, "ENG-3")] = [card("t_3", "running", "coder")]
+
+    await KanbanSync(client)._handle_event(BOARD, event(1, "t_3", "claimed"))
+
+    assert client.updates == [{"id": "issue-ENG-3", "stateId": "s-working"}]
+
+
+async def test_the_syncs_own_write_is_not_mistaken_for_a_hand_edit(boards):
+    client = FakeClient(current={"ENG-3": "Todo"})
+    sync = KanbanSync(client)
+    boards.shows["t_3"] = {"id": "t_3", "tenant": "ENG-3", "completed": False}
+    boards.cards_by[(BOARD, "ENG-3")] = [card("t_3", "running", "coder")]
+    await sync._handle_event(BOARD, event(1, "t_3", "claimed"))
+    assert len(client.updates) == 1
+
+    # Linear stamps updatedAt a few seconds after our own write; the card moves on
+    client.updated_at["ENG-3"] = _iso_ago(0)
+    boards.cards_by[(BOARD, "ENG-3")] = [card("t_3", "review", "coder")]
+    await sync._handle_event(BOARD, event(2, "t_3", "completed"))
+
+    assert [u["stateId"] for u in client.updates] == ["s-working", "s-reviewing"]
 
 
 async def test_reconcile_rolls_a_parent_up_from_its_children(boards):
@@ -1409,6 +1508,7 @@ async def test_an_ops_blocked_card_writes_blocked(boards):
 async def test_ops_all_done_with_a_merged_or_no_pr_writes_done(boards, attachments):
     client = FakeClient(current={"OPS-1": "In Review"}, attachments={"issue-OPS-1": attachments})
     ops_event_setup(boards, "OPS-1", "done", completed_at=1)
+    boards.done_whens["t_1"] = "pass"
 
     await KanbanSync(client)._handle_event(BOARD, event(1, "t_1", "completed"))
 

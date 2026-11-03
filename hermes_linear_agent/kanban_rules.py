@@ -83,6 +83,7 @@ class Card:
     status: str
     assignee: str | None
     completed_at: int | None
+    done_when: str | None = None
 
 
 def transition(action: str, was_type: str | None, type_: str | None) -> IssueAction:
@@ -116,6 +117,13 @@ def is_open(card: Card) -> bool:
 def is_completed(card: Card) -> bool:
     """A card is completed once it is done or carries a completion time."""
     return card.status == "done" or card.completed_at is not None
+
+
+def closed_with_work(cards: list[Card]) -> bool:
+    """True when no card is open and at least one was really completed (rows 5/6)."""
+    if not cards or any(is_open(card) for card in cards):
+        return False
+    return not all(card.status == "archived" and not is_completed(card) for card in cards)
 
 
 def _is_pr_number(value: object) -> bool:
@@ -158,7 +166,9 @@ def issue_status(cards: list[Card], attachments: list[dict] | None = None) -> st
     3. any card in review -> ``"Reviewing"``
     4. every open card is todo/ready/triage -> ``"Todo"``
     5. every card completed and a PR is open -> ``"Ready to Merge"``
-    6. every card completed, PR merged or none -> ``"Done"``
+    6. every card closed with real work done: PR merged -> ``"Done"``; no PR
+       and a card carries ``done_when == "pass"`` -> ``"Done"``; otherwise
+       ``None`` (ENG-2378: the issue keeps whatever state it has)
     7. every card archived and none completed -> ``"Canceled"``
     8. no cards -> ``None``
 
@@ -186,8 +196,13 @@ def issue_status(cards: list[Card], attachments: list[dict] | None = None) -> st
     # card is real work whatever dead duplicate was archived beside it
     # (ENG-2230, ENG-2234); only an all-archived, never-completed set is
     # Canceled (row 7).
-    if not open_cards and not all(card.status == "archived" and not is_completed(card) for card in cards):
-        return "Ready to Merge" if pr_gate(links) == "open" else "Done"
+    if closed_with_work(cards):
+        gate = pr_gate(links)
+        if gate == "open":
+            return "Ready to Merge"
+        if gate == "merged" or any(card.done_when == "pass" for card in cards):
+            return "Done"
+        return None
     if not open_cards:
         return "Canceled"
 

@@ -25,7 +25,10 @@ import logging
 import os
 import re
 import sqlite3
+import time
 from collections.abc import Callable
+from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -36,9 +39,12 @@ from .kanban_rules import (
     ACTED,
     CLOSED_TYPES,
     Card,
+    closed_with_work,
     hand_set,
+    is_completed,
     is_open,
     issue_status,
+    pr_gate,
     rollup,
     team_state_name,
     transition,
@@ -51,6 +57,11 @@ logger = logging.getLogger(__name__)
 WATCH_DEBOUNCE_MS = 100
 #: watchfiles re-checks the inotify queue this often while it waits.
 WATCH_STEP_MS = 20
+
+#: ENG-2378 hand-set guard: an issue edited this recently by someone else is left alone.
+HAND_SET_WINDOW_SECONDS = 30 * 60
+#: Linear stamps updatedAt a moment after the sync's own write; this much slack is still ours.
+OWN_WRITE_SLACK_SECONDS = 10.0
 
 #: How often a full reconcile pass runs.
 RECONCILE_SECONDS = 300.0
@@ -69,6 +80,7 @@ ISSUE = """query Issue($id: String!) {
   issue(id: $id) {
     id
     identifier
+    updatedAt
     state { id name type }
     team { id key }
     parent { id identifier }
@@ -100,6 +112,7 @@ ACTIVE_ISSUES = """query ActiveIssues($team: String!, $after: String) {
     nodes {
       id
       identifier
+      updatedAt
       title
       description
       url
@@ -197,6 +210,9 @@ class KanbanSync:
         self._state_types: dict[str, str | None] = {}
         # team id -> {state name: state id}, resolved once per process
         self._team_states: dict[str, dict[str, str]] = {}
+        # issue id -> epoch seconds of the sync's own last write (ENG-2378 hand-set guard)
+        self._wrote: dict[str, float] = {}
+        self._clock: Callable[[], float] = time.time
 
         self._followers: dict[str, asyncio.Task[None]] = {}
         self._discovery_task: asyncio.Task[None] | None = None
@@ -356,9 +372,10 @@ class KanbanSync:
 
         cards = await kanban_cli.cards(board, issue_key)
         status = issue_status(cards)
-        if status == "Done":
+        merged = False
+        if closed_with_work(cards):
             try:
-                status = issue_status(cards, await self._attachments(issue_key))
+                attachments = await self._attachments(issue_key)
             except asyncio.CancelledError:
                 raise
             except Exception as error:  # noqa: BLE001 - hold Done on the safe side
@@ -370,13 +387,19 @@ class KanbanSync:
                     _err_line(error),
                 )
                 status = "Ready to Merge"
+            else:
+                gate = pr_gate(attachments)
+                if gate == "none":
+                    cards = await self._with_done_when([(board, card) for card in cards])
+                status = issue_status(cards, attachments)
+                merged = gate == "merged"
 
         issue = await self._issue(issue_key)
         children = _nodes(issue.get("children"))
         if children:
             # An issue with sub-issues takes their rollup, never its own cards.
             status = rollup([str((child.get("state") or {}).get("name") or "") for child in children])
-        target = self._target(issue, status)
+        target = self._target(issue, status, merged=merged and not children)
         if target is None:
             return
         logger.info("%s %s %s -> %s status %s", board, task_id, kind, issue_key, target)
@@ -384,7 +407,30 @@ class KanbanSync:
         await self._rollup_parent(issue, target)
 
     @staticmethod
-    def _target(issue: dict[str, Any], status: str | None) -> str | None:
+    async def _with_done_when(pairs: list[tuple[str, Card]]) -> list[Card]:
+        """The cards with ``done_when`` filled in for every completed one (ENG-2378)."""
+        out: list[Card] = []
+        for board, card in pairs:
+            if is_completed(card):
+                card = replace(card, done_when=await kanban_cli.done_when(board, card.id))
+            out.append(card)
+        return out
+
+    def _edited_by_hand(self, issue: dict[str, Any]) -> bool:
+        """True when someone else edited the issue in the last 30 min (ENG-2378)."""
+        raw = issue.get("updatedAt")
+        if not isinstance(raw, str):
+            return False
+        try:
+            updated = datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return False
+        if self._clock() - updated > HAND_SET_WINDOW_SECONDS:
+            return False
+        wrote = self._wrote.get(str(issue.get("id") or ""))
+        return wrote is None or updated - wrote > OWN_WRITE_SLACK_SECONDS
+
+    def _target(self, issue: dict[str, Any], status: str | None, *, merged: bool = False) -> str | None:
         """The team's name for ``status``, or None when nothing should be written."""
         if status is None:
             return None
@@ -393,6 +439,9 @@ class KanbanSync:
             return None
         team_key = (issue.get("team") or {}).get("key")
         if hand_set(team_key, current.get("name")):
+            return None
+        if not merged and self._edited_by_hand(issue):
+            logger.info("hand-set %s %s, skipping", issue.get("identifier") or issue.get("id"), current.get("name"))
             return None
         name = team_state_name(team_key, status)
         if name == current.get("name"):
@@ -479,21 +528,28 @@ class KanbanSync:
             if not key:
                 continue
             children = issue.get("children") or []
+            merged = False
             if children:
                 # A parent takes its children's rollup, never its own cards.
                 status = rollup([str((child.get("state") or {}).get("name") or "") for child in children])
             else:
-                cards: list[Card] = []
+                pairs: list[tuple[str, Card]] = []
                 for row in rows:
                     slug = row.get("slug")
                     if slug:
-                        cards.extend(await kanban_cli.cards(slug, key))
-                if not cards:
+                        pairs.extend((slug, card) for card in await kanban_cli.cards(slug, key))
+                if not pairs:
                     continue
-                status = issue_status(cards, issue.get("attachments") or [])
+                cards = [card for _board, card in pairs]
+                links = issue.get("attachments") or []
+                gate = pr_gate(links)
+                if closed_with_work(cards) and gate == "none":
+                    cards = await self._with_done_when(pairs)
+                status = issue_status(cards, links)
+                merged = gate == "merged"
 
             state = issue.get("state") or {}
-            target = self._target(issue, status)
+            target = self._target(issue, status, merged=merged)
             if target is None:
                 continue
 
@@ -653,6 +709,7 @@ class KanbanSync:
         result = data.get("issueUpdate") or {}
         if not result.get("success"):
             raise RuntimeError("issueUpdate failed")
+        self._wrote[issue_id] = self._clock()
 
     async def _active_issues(self) -> list[dict[str, Any]]:
         found: list[dict[str, Any]] = []
@@ -703,6 +760,7 @@ def _normalize_issue(node: object) -> dict[str, Any] | None:
     return {
         "id": node["id"],
         "identifier": node["identifier"],
+        "updatedAt": node.get("updatedAt"),
         "title": node.get("title") or "",
         "description": node.get("description"),
         "url": node.get("url") or "",

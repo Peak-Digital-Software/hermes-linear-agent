@@ -33,8 +33,9 @@ def card(
     status: str,
     assignee: str | None = None,
     completed_at: int | None = None,
+    done_when: str | None = None,
 ) -> Card:
-    return Card(id=card_id, status=status, assignee=assignee, completed_at=completed_at)
+    return Card(id=card_id, status=status, assignee=assignee, completed_at=completed_at, done_when=done_when)
 
 
 def pr_link(number: int, status: str | None = None) -> dict:
@@ -295,17 +296,17 @@ def test_rollup_reads_ops_started_names_as_working():
         ),
         # row 6: every card completed, PR merged or none
         pytest.param(
-            [card("t_a", "done", completed_at=1), card("t_b", "done", completed_at=2)],
+            [card("t_a", "done", completed_at=1), card("t_b", "done", completed_at=2, done_when="pass")],
             "Done",
-            id="row6-done-set-with-no-pr",
+            id="row6-done-set-with-no-pr-and-done-when-evidence",
         ),
         pytest.param(
-            [card("t_a", "done", completed_at=1), card("t_b", "archived")],
+            [card("t_a", "done", completed_at=1, done_when="pass"), card("t_b", "archived")],
             "Done",
             id="row6-done-plus-archived-never-completed-is-done",
         ),
         pytest.param(
-            [card("t_a", "done", completed_at=1), card("t_b", "archived", completed_at=2)],
+            [card("t_a", "done", completed_at=1), card("t_b", "archived", completed_at=2, done_when="pass")],
             "Done",
             id="row6-done-plus-archived-completed-is-done",
         ),
@@ -331,8 +332,8 @@ def test_issue_status_follows_the_eight_row_precedence(cards, expected):
 @pytest.mark.parametrize(
     ("links", "expected"),
     [
-        pytest.param([], "Done", id="completed-set-with-no-pr"),
-        pytest.param([REPO_LINK], "Done", id="completed-set-with-only-a-repo-link"),
+        pytest.param([], "Done", id="completed-set-with-no-pr-but-evidence"),
+        pytest.param([REPO_LINK], "Done", id="completed-set-with-only-a-repo-link-and-evidence"),
         pytest.param([REPO_LINK, pr_link(156, "open")], "Ready to Merge", id="completed-set-with-an-open-pr"),
         pytest.param([pr_link(156, "merged")], "Done", id="completed-set-with-a-merged-pr"),
         pytest.param([pr_link(1, "merged"), pr_link(2, "open")], "Ready to Merge", id="one-open-pr-holds-ready"),
@@ -344,10 +345,27 @@ def test_issue_status_follows_the_eight_row_precedence(cards, expected):
     ],
 )
 def test_a_completed_card_set_is_ready_to_merge_only_when_no_pr_is_merged(links, expected):
-    done_set = [card("t_a", "done", completed_at=1), card("t_b", "done", completed_at=2)]
+    done_set = [card("t_a", "done", completed_at=1), card("t_b", "done", completed_at=2, done_when="pass")]
     if links == [pr_link(1, "merged")]:
         done_set = [card("t_a", "done", completed_at=1), card("t_b", "archived")]
     assert issue_status(done_set, links) == expected
+
+
+@pytest.mark.parametrize("links", [[], [REPO_LINK]])
+def test_all_done_without_a_pr_or_evidence_writes_nothing(links):
+    done_set = [card("t_a", "done", completed_at=1), card("t_b", "done", completed_at=2, done_when="fail")]
+    assert issue_status(done_set, links) is None
+    assert issue_status(done_set) is None
+
+
+def test_done_when_evidence_on_any_one_card_is_enough_without_a_pr():
+    done_set = [card("t_a", "done", completed_at=1), card("t_b", "done", completed_at=2, done_when="pass")]
+    assert issue_status(done_set, []) == "Done"
+
+
+def test_evidence_never_beats_an_open_pr():
+    done_set = [card("t_a", "done", completed_at=1, done_when="pass")]
+    assert issue_status(done_set, [pr_link(156, "open")]) == "Ready to Merge"
 
 
 def test_attachments_default_to_none_and_never_gate_a_non_done_status():
