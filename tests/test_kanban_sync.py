@@ -1029,6 +1029,46 @@ async def test_start_returns_the_discovery_and_reconcile_tasks(boards, idle_watc
         await asyncio.gather(*tasks, *followers, return_exceptions=True)
 
 
+async def test_start_adds_the_pr_loop_only_when_pr_gh_is_set(boards, idle_watch, tmp_path, monkeypatch):
+    async def noop(**_kwargs):
+        return []
+
+    monkeypatch.setattr("hermes_linear_agent.pr_reconcile.reconcile_prs", noop)
+    sync = KanbanSync(FakeClient(), boards_root=tmp_path / "boards", reconcile_seconds=60, pr_gh="/bin/gh")
+    boards.cursors[BOARD] = 0
+
+    tasks = sync.start()
+    try:
+        await until(lambda: BOARD in sync._followers)
+        assert len(tasks) == 3
+    finally:
+        followers = list(sync._followers.values())
+        for task in [*tasks, *followers]:
+            task.cancel()
+        await asyncio.gather(*tasks, *followers, return_exceptions=True)
+
+
+async def test_the_pr_loop_survives_a_raising_pass(monkeypatch):
+    calls = []
+
+    async def flaky(*, gh):
+        calls.append(gh)
+        if len(calls) == 1:
+            raise RuntimeError("boom")
+        return []
+
+    monkeypatch.setattr("hermes_linear_agent.pr_reconcile.reconcile_prs", flaky)
+    sync = KanbanSync(FakeClient(), pr_gh="/bin/gh", pr_seconds=0)
+    task = asyncio.create_task(sync._pr_loop())
+    try:
+        await until(lambda: len(calls) >= 2)
+        assert not task.done()
+        assert calls[:2] == ["/bin/gh", "/bin/gh"]
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
 async def test_cancelling_the_discovery_task_cancels_its_followers(boards, idle_watch, tmp_path):
     sync = KanbanSync(FakeClient(), boards_root=tmp_path / "boards", reconcile_seconds=60)
     boards.cursors[BOARD] = 0
