@@ -254,3 +254,18 @@ Hardening applied on top of upstream `626b037` (see the `tests/test_peak_*.py` s
 - **Auto-start on delegation (default on, opt-out):** when an issue is delegated to the agent (an assignment/update webhook, or the issue's `delegate` is this app user), the adapter moves it to the team's first `started` workflow state (lowest `position`) — Linear's published best practice. Opt out with `auto_start_on_delegation: false`; also gated on `mutation_policy.update_issues`. Issues in a `triage` state are left alone so humans keep control of triage, and a bare @-mention is not treated as delegation.
 - **Self-delegation (opt-in, default off):** with `auto_self_delegate: true` (or `LINEAR_AGENT_AUTO_SELF_DELEGATE`), auto-started issues that have NO delegate are also claimed by the agent. By default the adapter **never delegates issues to itself** — humans decide what the agent owns.
 - **Permission-change awareness:** OAuth `revoked` and `teamAccessChanged` webhook events are logged loudly at WARNING (instead of being silently ignored) so a revoked token or lost team access is diagnosable.
+
+## Gateway restarts and peer mentions
+
+The plugin keeps a turn journal at `<hermes_home>/plugin-state/linear-agent/turn_journal.json`.
+A message that arrives while the gateway is draining is queued there (and a thought tells the
+session so). A turn that was running when the gateway stopped is marked in flight until its final
+`send()`. After the next `connect()` the plugin waits for the gateway to report `running`, then
+wakes each interrupted issue with "Resume after gateway restart" and replays each queued message.
+
+A comment that mentions this app from a listed `peer_app_user_ids` agent becomes a wake turn on the
+issue's session. Mentions are counted per issue in `peer_mentions.json`; past `max_agent_handoffs`
+the plugin posts a handoff-limit notice and starts no turn.
+
+Core gap: routing entries for plugin platforms are not re-validated after registration, so the
+plugin journals its own turns instead.
