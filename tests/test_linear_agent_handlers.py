@@ -1620,3 +1620,47 @@ async def test_customer_queries_select_tier_and_status_subfields():
         normalized = " ".join(query.split())
         assert "tier { id name }" in normalized
         assert "status { id name }" in normalized
+
+
+# ENG-2324: the registry calls handler(args, task_id=<hermes task>, session_id=...,
+# user_task=...). Those dispatcher kwargs must never stand in for model args.
+_U23 = "11111111-1111-4111-8111-111111111123"
+_U22 = "11111111-1111-4111-8111-111111111122"
+
+
+class _KeyedRefClient(_FakeRefClient):
+    async def get_issue(self, id):
+        self.calls.append(("get_issue", id))
+        uid = {"ENG-2323": _U23, "ENG-2322": _U22}.get(id, id)
+        return {"id": uid, "team": {"id": "team-1"}, "project": {"id": "proj-1"}}
+
+
+def _registry_call(handler, args):
+    return handler(args, task_id="hermes-task-xyz", session_id="hermes-session-xyz", user_task="do it")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ref", ["ENG-2323", _U23])
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"state": "Done"}, ("update_issue", _U23, {"stateId": "state-done"})),
+        ({"title": "New"}, ("update_issue", _U23, {"title": "New"})),
+        ({"blockedBy": ["ENG-2322"]}, ("create_issue_relation", "ENG-2322", _U23, "blocks")),
+        ({"blocks": ["ENG-2322"]}, ("create_issue_relation", _U23, "ENG-2322", "blocks")),
+        ({"relatedTo": ["ENG-2322"]}, ("create_issue_relation", _U23, "ENG-2322", "related")),
+    ],
+)
+async def test_update_issue_registry_dispatch_kwargs_do_not_hijack_id(ref, payload, expected):
+    from hermes_linear_agent import tools as t
+
+    adapter = _adapter_with_ref_client()
+    adapter._client = client = _KeyedRefClient()
+
+    result = await _registry_call(t.linear_agent_update_issue, {"id": ref, "input": dict(payload)})
+
+    assert result.startswith(f"✅ Updated {_U23}"), result
+    assert expected in client.calls
+    assert not any("hermes-task-xyz" in map(str, c) for c in client.calls)
+    # Dispatcher kwargs must not leak into the update payload either.
+    assert not any(c[0] == "update_issue" and "session_id" in c[2] for c in client.calls)
