@@ -102,18 +102,34 @@ async def show(board: str, task_id: str) -> dict:
     }
 
 
-async def done_when(board: str, task_id: str) -> str | None:
-    """The ``done_when`` metadata of the card's latest run; None on any error (ENG-2378)."""
+async def run_metadata(board: str, task_id: str) -> dict:
+    """The metadata of the card's latest run; ``{}`` on any error (ENG-2378)."""
     try:
         out = await _exec(["kanban", "--board", board, "show", task_id, "--json"])
         runs = [run for run in json.loads(out).get("runs") or [] if isinstance(run, dict)]
         if not runs:
-            return None
+            return {}
         latest = max(enumerate(runs), key=lambda pair: (pair[1].get("ended_at") or 0, pair[0]))[1]
-        value = (latest.get("metadata") or {}).get("done_when")
-        return value if isinstance(value, str) else None
+        meta = latest.get("metadata")
+        return meta if isinstance(meta, dict) else {}
     except Exception:  # noqa: BLE001 - no evidence is the safe answer
-        return None
+        return {}
+
+
+async def done_when(board: str, task_id: str) -> str | None:
+    """The ``done_when`` metadata of the card's latest run; None on any error (ENG-2378)."""
+    value = (await run_metadata(board, task_id)).get("done_when")
+    return value if isinstance(value, str) else None
+
+
+async def open_cards(board: str, assignee: str) -> list[dict]:
+    """The assignee's open cards (not done/archived) as ``{id, title, status}``."""
+    out = await _exec(["kanban", "--board", board, "list", "--assignee", assignee, "--json"])
+    return [
+        {"id": row["id"], "title": row.get("title"), "status": row["status"]}
+        for row in json.loads(out)
+        if row.get("status") not in ("done", "archived")
+    ]
 
 
 async def create(

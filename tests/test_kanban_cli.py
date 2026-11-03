@@ -142,6 +142,48 @@ async def test_done_when_is_none_when_the_cli_fails(monkeypatch):
     assert await kanban_cli.done_when("b", "t_a") is None
 
 
+async def test_run_metadata_is_the_latest_runs_metadata_from_one_show_call(fake_exec):
+    runs = [
+        {"id": 1, "ended_at": 5, "metadata": {"evidence_url": "old"}},
+        {"id": 2, "ended_at": 9, "metadata": {"evidence_url": "https://x/c", "done_when": "pass"}},
+    ]
+    fake = fake_exec(json.dumps({"task": {"id": "t_a"}, "runs": runs}))
+
+    assert await kanban_cli.run_metadata("b", "t_a") == {"evidence_url": "https://x/c", "done_when": "pass"}
+    assert fake.calls == [["kanban", "--board", "b", "show", "t_a", "--json"]]
+
+
+async def test_run_metadata_is_empty_without_runs_metadata_or_on_error(fake_exec, monkeypatch):
+    fake_exec(json.dumps({"task": {"id": "t_a"}, "runs": []}))
+    assert await kanban_cli.run_metadata("b", "t_a") == {}
+    fake_exec(json.dumps({"task": {"id": "t_a"}, "runs": [{"id": 1, "ended_at": 1, "metadata": None}]}))
+    assert await kanban_cli.run_metadata("b", "t_a") == {}
+    fake_exec("not json {")
+    assert await kanban_cli.run_metadata("b", "t_a") == {}
+
+    async def boom(*args, **kwargs):
+        raise OSError("no hermes")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", boom)
+    assert await kanban_cli.run_metadata("b", "t_a") == {}
+
+
+async def test_open_cards_lists_an_assignees_cards_and_drops_closed_ones(fake_exec):
+    rows = [
+        {"id": "t_1", "title": "Verify: r#1 @ abc", "status": "running", "assignee": "visual-proof"},
+        {"id": "t_2", "title": "Verify: r#2 @ def", "status": "done", "assignee": "visual-proof"},
+        {"id": "t_3", "title": "Verify: r#3 @ 123", "status": "archived", "assignee": "visual-proof"},
+        {"id": "t_4", "title": "Verify: r#4 @ 456", "status": "ready", "assignee": "visual-proof"},
+    ]
+    fake = fake_exec(json.dumps(rows))
+
+    assert await kanban_cli.open_cards("engineering", "visual-proof") == [
+        {"id": "t_1", "title": "Verify: r#1 @ abc", "status": "running"},
+        {"id": "t_4", "title": "Verify: r#4 @ 456", "status": "ready"},
+    ]
+    assert fake.calls == [["kanban", "--board", "engineering", "list", "--assignee", "visual-proof", "--json"]]
+
+
 async def test_archive_makes_one_call_for_every_card(fake_exec):
     fake = fake_exec("")
 

@@ -392,7 +392,7 @@ class KanbanSync:
                 status = "Ready to Merge"
             else:
                 gate = pr_gate(attachments)
-                if gate == "none":
+                if gate in ("none", "open"):
                     cards = await self._with_done_when([(board, card) for card in cards])
                 status = issue_status(cards, attachments)
                 merged = gate == "merged"
@@ -411,11 +411,18 @@ class KanbanSync:
 
     @staticmethod
     async def _with_done_when(pairs: list[tuple[str, Card]]) -> list[Card]:
-        """The cards with ``done_when`` filled in for every completed one (ENG-2378)."""
+        """The cards with ``done_when`` and ``evidence_url`` filled in for every completed one (ENG-2378)."""
         out: list[Card] = []
         for board, card in pairs:
             if is_completed(card):
-                card = replace(card, done_when=await kanban_cli.done_when(board, card.id))
+                meta = await kanban_cli.run_metadata(board, card.id)
+                done_when = meta.get("done_when")
+                evidence = meta.get("evidence_url")
+                card = replace(
+                    card,
+                    done_when=done_when if isinstance(done_when, str) else None,
+                    evidence_url=evidence if isinstance(evidence, str) and evidence.strip() else None,
+                )
             out.append(card)
         return out
 
@@ -553,7 +560,7 @@ class KanbanSync:
                 cards = [card for _board, card in pairs]
                 links = issue.get("attachments") or []
                 gate = pr_gate(links)
-                if closed_with_work(cards) and gate == "none":
+                if closed_with_work(cards) and gate in ("none", "open"):
                     cards = await self._with_done_when(pairs)
                 status = issue_status(cards, links)
                 merged = gate == "merged"
