@@ -221,6 +221,7 @@ class Boards:
         self.paths: dict[str, str] = {}
         self.cards_by: dict[tuple[str, str], list[Card]] = {}
         self.done_whens: dict[str, str | None] = {}
+        self.evidence_urls: dict[str, str] = {}
         self.shows: dict[str, dict[str, Any]] = {}
         self.events: dict[str, list[dict[str, Any]]] = {}
         self.cursors: dict[str, int] = {}
@@ -244,8 +245,13 @@ class Boards:
     async def show(self, board: str, task_id: str) -> dict[str, Any]:
         return dict(self.shows.get(task_id, {"id": task_id, "tenant": None, "completed": False}))
 
-    async def done_when(self, board: str, task_id: str) -> str | None:
-        return self.done_whens.get(task_id)
+    async def run_metadata(self, board: str, task_id: str) -> dict[str, Any]:
+        meta: dict[str, Any] = {}
+        if self.done_whens.get(task_id) is not None:
+            meta["done_when"] = self.done_whens[task_id]
+        if task_id in self.evidence_urls:
+            meta["evidence_url"] = self.evidence_urls[task_id]
+        return meta
 
     async def archive(self, board: str, ids: list[str]) -> None:
         self.archive_calls.append((board, list(ids)))
@@ -286,7 +292,7 @@ def cli(monkeypatch) -> Boards:
     monkeypatch.setattr(kanban_cli, "boards", fake.boards)
     monkeypatch.setattr(kanban_cli, "cards", fake.cards)
     monkeypatch.setattr(kanban_cli, "show", fake.show)
-    monkeypatch.setattr(kanban_cli, "done_when", fake.done_when)
+    monkeypatch.setattr(kanban_cli, "run_metadata", fake.run_metadata)
     monkeypatch.setattr(kanban_cli, "archive", fake.archive)
     return fake
 
@@ -721,11 +727,23 @@ async def test_an_open_pr_holds_a_completed_card_set_in_ready_to_merge(boards):
     )
     sync = KanbanSync(client)
     boards.shows["t_1"] = {"id": "t_1", "tenant": "ENG-1", "completed": True}
-    boards.cards_by[(BOARD, "ENG-1")] = [card("t_1", "done", "coder", 1), card("t_2", "done", "reviewer", 2)]
+    boards.cards_by[(BOARD, "ENG-1")] = [card("t_1", "done", "coder", 1), card("t_2", "done", "visual-proof", 2)]
+    boards.evidence_urls["t_2"] = "https://linear.app/x/issue/ENG-1#comment-1"
 
     await sync._handle_event(BOARD, event(1, "t_1", "completed"))
 
     assert client.updates == [{"id": "issue-ENG-1", "stateId": "s-ready-to-merge"}]
+
+
+async def test_an_open_pr_with_a_verify_card_lacking_evidence_is_blocked(boards):
+    client = FakeClient(current={"ENG-1": "Working"}, attachments={"issue-ENG-1": [pr_link(156, "open")]})
+    sync = KanbanSync(client)
+    boards.shows["t_1"] = {"id": "t_1", "tenant": "ENG-1", "completed": True}
+    boards.cards_by[(BOARD, "ENG-1")] = [card("t_1", "done", "coder", 1), card("t_2", "done", "visual-proof", 2)]
+
+    await sync._handle_event(BOARD, event(1, "t_1", "completed"))
+
+    assert client.updates == [{"id": "issue-ENG-1", "stateId": "s-blocked"}]
 
 
 async def test_a_merged_pr_lets_the_completed_card_set_reach_done(boards):
@@ -1300,7 +1318,8 @@ async def test_reconcile_writes_blocked_while_any_card_is_blocked(boards):
 async def test_reconcile_holds_done_for_an_open_pr(boards):
     client = FakeClient(active_pages={None: page([active_issue("ENG-18", "Working", [pr_link(156, "open")])])})
     sync = KanbanSync(client)
-    boards.cards_by[(BOARD, "ENG-18")] = [card("t_a", "done", "coder", 1), card("t_b", "done", "reviewer", 2)]
+    boards.cards_by[(BOARD, "ENG-18")] = [card("t_a", "done", "coder", 1), card("t_b", "done", "visual-proof", 2)]
+    boards.evidence_urls["t_b"] = "https://linear.app/x/issue/ENG-18#comment-1"
 
     assert await sync.reconcile() == 1
     assert client.updates == [{"id": "issue-ENG-18", "stateId": "s-ready-to-merge"}]
