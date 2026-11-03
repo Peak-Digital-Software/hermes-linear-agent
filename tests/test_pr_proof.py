@@ -89,6 +89,8 @@ async def test_ui_pr_on_production_repo_creates_one_card():
     assert "ENG-100" in body
     assert "peak-preview up alpha --ref feat-7 --json" in body
     assert "Head sha: abcdef1234567890" in body
+    assert "Follow skill visual-proof." in body
+    assert "PNG" not in body and "steps comment" not in body
 
 
 async def test_second_pass_creates_nothing():
@@ -157,7 +159,7 @@ async def test_failing_repo_does_not_stop_another():
 async def test_pr_without_issue_key_says_post_on_pr_only():
     f = Fakes({"alpha": [_pr(title="no key here")]}, files={("alpha", 7): ["a.tsx"]})
     await f.run()
-    assert "none: PR has no issue key, post on the PR only" in f.creates[0][2]["body"]
+    assert "none: PR has no issue key, block" in f.creates[0][2]["body"]
 
 
 # --- github_prs additions ---------------------------------------------------

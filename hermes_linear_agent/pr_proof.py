@@ -34,25 +34,16 @@ def proof_tenant(repo: str) -> str:
 
 
 def proof_body(pr: github_prs.OpenPr, key: str, repo: str) -> str:
-    issue = key or "none: PR has no issue key, post on the PR only"
-    return f"""Visual proof for {pr.full_name}#{pr.number}: {pr.title}
+    issue = key or "none: PR has no issue key, block"
+    return f"""Follow skill visual-proof.
 
-- PR: {pr.url}
-- Head sha: {pr.head_sha}
-- Branch: {pr.branch}
-- Issue: {issue}
+Repo: {repo}
+PR: {pr.full_name}#{pr.number} ({pr.url})
+Branch: {pr.branch}
+Head sha: {pr.head_sha}
+Issue: {issue}
 
-Use the skill `visual-proof`.
-
-1. Bring up the branch preview: `peak-preview up {repo} --ref {pr.branch} --json`.
-2. Capture the "after" shots of every changed UI surface, then tear the branch preview down.
-3. Only after the branch preview is down, bring up `--ref prod` for the "before" shots, then tear that down too.
-
-Deliver:
-- at least 3 PNGs and 1 webm on the issue ({issue}),
-- one steps comment on the PR ({pr.url}).
-
-Rules: dev data only. Full teardown of every preview you start, also on failure.
+Bring up the branch preview: `peak-preview up {repo} --ref {pr.branch} --json`.
 
 Complete with metadata `{{"screenshots", "video", "comment", "head_sha"}}`; `head_sha` is {pr.head_sha}.
 """
