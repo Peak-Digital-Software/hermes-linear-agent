@@ -678,13 +678,13 @@ query ProjectUpdate($id: String!) {
 mutation CustomerNeedUpdate($id: String!, $input: CustomerNeedUpdateInput!) {
   customerNeedUpdate(id: $id, input: $input) {
     success
-    customerNeed { id body }
+    need { id body }
   }
 }
 """,
             {"id": need_id, "input": input_payload},
             op="customerNeedUpdate",
-            entity="customerNeed",
+            entity="need",
             policy_key="update_customer_needs",
             what="Customer need update",
             mutation_policy=mutation_policy,
@@ -701,13 +701,13 @@ mutation CustomerNeedUpdate($id: String!, $input: CustomerNeedUpdateInput!) {
 mutation CustomerNeedCreate($input: CustomerNeedCreateInput!) {
   customerNeedCreate(input: $input) {
     success
-    customerNeed { id body customer { id name } }
+    need { id body customer { id name } }
   }
 }
 """,
             {"input": input_payload},
             op="customerNeedCreate",
-            entity="customerNeed",
+            entity="need",
             policy_key="create_customer_needs",
             what="Customer need creation",
             mutation_policy=mutation_policy,
